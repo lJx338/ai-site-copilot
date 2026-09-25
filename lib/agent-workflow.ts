@@ -145,7 +145,12 @@ const foundationPrompt = `你是建站 Agent 的「全站基础」阶段。系�
 6. 写 docs/content-todo.md：列出所有由你补全的示例事实，方便上线前替换。
 7. 可以在 src/components/ 下新增可复用的展示组件（例如区块标题、数据条、评价卡、图片框），供各页面使用。
 
-用 write_file 一次写出完整文件。结束时用两三句话说明视觉方向和提供给页面的共享组件。`;
+写入要求：
+- 第 1 轮就同时写出 tokens.css、design/tokens.json、src/content/site.ts 和 index.html；第 2 轮同时写出 globals.css、Header、Footer 和共享组件。
+- globals.css 一次写完整（控制在 25KB 以内），之后最多再用 apply_patch 修补 2 次，不要反复零碎修改。
+- 不要修改 src/app/router.tsx、src/app/App.tsx 和 src/pages 下的文件。
+- 需要的文件都已附在消息里，不需要再读取其他文件。
+结束时用两三句话说明视觉方向和提供给页面的共享组件。`;
 
 function pagePrompt(page: PlannedPage, routeList: string) {
   const prefix = page.component.replace(/Page$/, "");
@@ -782,11 +787,16 @@ async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) 
     issues.push(...await typeErrors(projectId, root, (line) => !line.startsWith("src/pages/")));
     return issues;
   };
+  const readScope: ReadScope = {
+    reason: "页面文件目前只是骨架，由后续的页面 Agent 实现；需要的文件已经附在消息里。",
+    allows: (file) => !file.startsWith("src/pages/") && !file.startsWith("skills/") && file !== "AGENT.md",
+  };
   return runAgent({
-    apiKey, root, emit, scope, verify,
+    apiKey, root, emit, scope, readScope, verify,
     tag: "全站基础",
-    tools: authoringTools,
-    maxTurns: 14,
+    tools: focusedTools,
+    maxTurns: 10,
+    mustWrite: "src/styles/globals.css、src/content/site.ts、Header 和 Footer",
     system: `${foundationPrompt}\n\n${contentPolicy}`,
     user: `项目 ID：${projectId}\n用户需求：\n${message}\n\n网站计划：\n${JSON.stringify({ summary: plan.summary, brand: plan.brand, pages: planned.map((page) => ({ name: page.name, route: page.route, file: page.file, goal: page.goal })) }, null, 2)}\n\n已注册路由：${routeListOf(planned)}\n\n# docs/design.md\n${truncate(design, 24000)}\n\n# 当前文件\n${files}`,
   });
