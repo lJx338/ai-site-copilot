@@ -80,6 +80,8 @@ type ToolDefinition = (typeof editTools)[number];
 const pickTools = (names: string[]) => editTools.filter((tool) => names.includes(tool.function.name));
 // 写代码的 Agent 不需要自己调用检查工具：它结束回复后系统会自动检查并把问题发回。
 const authoringTools = pickTools(["list_files", "read_file", "search_code", "apply_patch", "write_file"]);
+// 页面、全站基础和修复 Agent：需要的文件预先附上，不给搜索和列目录，避免漫游式阅读。
+const focusedTools = pickTools(["read_file", "apply_patch", "write_file"]);
 const readOnlyTools = pickTools(["list_files", "read_file", "search_code", "check_project", "check_content"]);
 
 const PAGE_CONCURRENCY = 3;
@@ -154,7 +156,8 @@ function pagePrompt(page: PlannedPage, routeList: string) {
 3. 页面专属样式写在 src/styles/pages/${page.slug}.css，并在页面文件里 import "../styles/pages/${page.slug}.css"。使用 tokens.css 的变量；类名统一加 "${page.slug}-" 前缀，避免与其他页面冲突。
 4. 需要拆分组件时，放在 src/components/sections/ 下，文件名以 ${prefix} 开头。不要修改其他任何文件（包括全局样式、Header、Footer 和共享组件）。
 5. 内部链接只能指向这些已注册路由：${routeList}。
-6. 优先用 write_file 一次写出完整文件。结束时用两三句话说明页面结构和设计取舍。`;
+6. 写入顺序：第 1 轮就在同一轮里同时写出三个文件——${page.file}、src/content/${page.slug}.ts、src/styles/pages/${page.slug}.css。区块直接写在页面文件里即可，拆分组件不是必须的；绝不能只写数据或组件而把页面留成骨架。写完后系统会自动检查，有问题会告诉你。
+7. 结束时用两三句话说明页面结构和设计取舍。`;
 }
 
 export function parseArgs(raw: string) {
@@ -574,7 +577,12 @@ function normalizeToolPath(value: unknown) {
   return String(value ?? "").replaceAll("\\", "/").replace(/^\.?\/+/, "");
 }
 
-async function executeTool(name: string, args: Record<string, unknown>, root: string, scope?: WriteScope) {
+type ReadScope = { reason: string; allows: (relativePath: string) => boolean };
+
+async function executeTool(name: string, args: Record<string, unknown>, root: string, scope?: WriteScope, readScope?: ReadScope) {
+  if (name === "read_file" && readScope && !readScope.allows(normalizeToolPath(args.path))) {
+    throw new Error(`不需要读取 ${normalizeToolPath(args.path)}：${readScope.reason}`);
+  }
   if ((name === "apply_patch" || name === "write_file") && scope && !scope.allows(normalizeToolPath(args.path))) {
     throw new Error(`当前阶段不允许修改 ${normalizeToolPath(args.path)}。只允许修改：${scope.description}`);
   }
@@ -606,6 +614,7 @@ type AgentOptions = {
   maxTurns: number;
   tag?: string;
   scope?: WriteScope;
+  readScope?: ReadScope;
   verify?: () => Promise<string[]>;
   maxVerifyRounds?: number;
   // 轮数快用完时，提醒 Agent 必须先写出的文件（例如页面文件本身）
@@ -677,7 +686,7 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
         await options.emit({ type: "tool_started", name: call.function.name, label });
         const toolStarted = Date.now();
         try {
-          const result = await executeTool(call.function.name, args, options.root, options.scope);
+          const result = await executeTool(call.function.name, args, options.root, options.scope, options.readScope);
           events.push(label);
           run?.tools.push({ agent: agentName, stage: scope.stage, name: call.function.name, path, ok: true, ms: Date.now() - toolStarted, argChars: call.function.arguments.length, resultChars: result.length });
           if (path && (call.function.name === "write_file" || call.function.name === "apply_patch")) record.writtenFiles[path] = (record.writtenFiles[path] ?? 0) + 1;
@@ -780,21 +789,27 @@ async function runPage(context: ExecutionContext, page: PlannedPage, planned: Pl
   const pagePlan = plan.pages.find((item) => normalizeRoute(item.route) === page.route);
   const summaries = await listWorkspaceSummaries(root);
   const sharedComponents = summaries.filter((file) => file.path.startsWith("src/components/") && !file.path.startsWith("src/components/sections/")).map((file) => file.path);
-  const files = await fileBundle(root, [page.file, "src/content/site.ts", "src/styles/tokens.css", "src/app/router.tsx", ...sharedComponents.filter((file) => !file.endsWith("Header.tsx") && !file.endsWith("Footer.tsx"))], 8000);
+  // 完整附上页面需要的共享文件（基线里 site.ts 被截断，Agent 只好一遍遍重新读取）
+  const files = await fileBundle(root, [page.file, "src/content/site.ts", "src/styles/tokens.css", "src/app/router.tsx", ...sharedComponents.filter((file) => !file.endsWith("Header.tsx") && !file.endsWith("Footer.tsx"))], 40000);
   const globals = await readOptionalFile(root, "src/styles/globals.css");
   const prefix = page.component.replace(/Page$/, "");
   const owned = (file: string) => file === page.file || file.startsWith(`src/content/${page.slug}`) || file === `src/styles/pages/${page.slug}.css` || file.startsWith(`src/components/sections/${prefix}`);
   const scope: WriteScope = { description: `${page.file}、src/content/${page.slug}*.ts、src/styles/pages/${page.slug}.css、src/components/sections/${prefix}*.tsx`, allows: owned };
+  const readScope: ReadScope = {
+    reason: "其他页面由别的 Agent 并行实现，不要参考它们；需要的共享文件已经附在消息里。",
+    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/"),
+  };
   const verify = async () => {
     const issues = pageIssues(await listWorkspaceFiles(root), page.file);
     issues.push(...await typeErrors(projectId, root, (line) => owned(line.split("(")[0])));
     return issues;
   };
   return runAgent({
-    apiKey, root, emit, scope, verify,
+    apiKey, root, emit, scope, readScope, verify,
     tag: page.name,
-    tools: authoringTools,
-    maxTurns: 10,
+    tools: focusedTools,
+    maxTurns: 8,
+    mustWrite: page.file,
     system: `${pagePrompt(page, routeListOf(planned))}\n\n${contentPolicy}`,
     user: `项目 ID：${projectId}\n用户需求：\n${message}\n\n# 本页计划\n${JSON.stringify({ ...pagePlan, route: page.route, file: page.file }, null, 2)}\n\n# design.md（全局部分 + 本页蓝图）\n${designExcerpt(design, page.route)}\n\n# globals.css 中已有的类名（可以直接使用）\n${cssClassSummary(globals)}\n\n# 当前文件\n${files}`,
   });
