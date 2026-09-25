@@ -114,6 +114,15 @@ export class RunTelemetry {
   repairs: Array<{ round: number; problems: string[] }> = [];
   transcripts: Record<string, unknown[]> = {};
   finalFiles: Array<{ path: string; bytes: number }> = [];
+  // 代码层面的自动修复（不花模型费用），以及用于和其他运行对比的质量指标
+  autofixes: Array<{ stage: string; fixes: string[] }> = [];
+  quality?: {
+    passed: boolean;
+    pages: Array<{ route: string; file: string; stub: boolean; codeBytes: number; cssBytes: number; files: number; renderedChars?: number }>;
+    reviewScore?: number;
+    reviewOk?: boolean;
+    reviewIssues?: string[];
+  };
   private seq = 0;
   private currentStage?: { stage: string; startedMs: number };
 
@@ -184,6 +193,8 @@ export class RunTelemetry {
       pricing: { ...pricing, model: process.env.DEEPSEEK_MODEL || "deepseek-flash", peakPrices: peakPrices(process.env.DEEPSEEK_MODEL || "deepseek-flash"), peakCalls: deepseek.filter((call) => call.peak).length, offPeakCalls: deepseek.filter((call) => !call.peak).length },
       totals: {
         costCny: round(Object.values(costOf).reduce((total, value) => total + value, 0)),
+        // 统一按高峰价换算，不同时段的运行才能直接比较
+        costAtPeakCny: round(deepseek.reduce((total, call) => total + (call.peak ? call.costCny : call.costCny / pricing.offPeakDiscount), 0)),
         // 如果全部按空闲时段价格计算，这次会花多少
         costIfOffPeakCny: round(deepseek.reduce((total, call) => total + call.costCny * (call.peak ? pricing.offPeakDiscount : 1), 0)),
         costBreakdownCny: costOf,
@@ -220,6 +231,8 @@ export class RunTelemetry {
       }, {})).map(([name, value]) => ({ name, ...value })),
       topCalls: [...this.llmCalls].sort((a, b) => b.costCny - a.costCny).slice(0, 12),
       finalFiles: this.finalFiles,
+      autofixes: this.autofixes,
+      quality: this.quality,
     };
   }
 
@@ -272,9 +285,14 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
   const t = summary.totals;
   const lines = [
     `===== 运行报告 ${summary.runId} · ${summary.intent ?? "?"} · ${summary.outcome ?? "?"} =====`,
-    `总费用 ≈ ¥${t.costCny}（按调用时间计 ${summary.pricing.peakCalls} 次高峰 / ${summary.pricing.offPeakCalls} 次空闲价；全部空闲时段约 ¥${t.costIfOffPeakCny}）`,
+    `总费用 ≈ ¥${t.costCny}（按高峰价换算 ¥${t.costAtPeakCny}；按调用时间计 ${summary.pricing.peakCalls} 次高峰 / ${summary.pricing.offPeakCalls} 次空闲价；全部空闲时段约 ¥${t.costIfOffPeakCny}）`,
     `  构成：缓存命中输入 ¥${t.costBreakdownCny.cacheHit} / 未命中输入 ¥${t.costBreakdownCny.cacheMiss} / 正文输出 ¥${t.costBreakdownCny.output} / 思考 ¥${t.costBreakdownCny.reasoning} / Jev ¥${t.costBreakdownCny.jev}）`,
     `总用时 ${s(summary.wallMs)} · 模型调用 ${t.llmCalls} 次 · 输入 ${k(t.promptTokens)}（缓存命中率 ${Math.round(t.cacheHitRate * 100)}%）· 输出 ${k(t.completionTokens)}（其中思考 ${Math.round(t.reasoningShareOfOutput * 100)}%）· 截断 ${t.truncatedCalls} · 工具调用 ${t.toolCalls}（失败 ${t.failedToolCalls}）· 修复 ${t.repairRounds} 轮`,
+    ...(summary.quality ? [
+      `质量：${summary.quality.passed ? "验收通过" : "验收未通过"} · 页面 ${summary.quality.pages.filter((page) => !page.stub).length}/${summary.quality.pages.length} 已实现 · 审查 ${summary.quality.reviewScore ?? "-"} 分`,
+      ...summary.quality.pages.map((page) => `  ${page.route.padEnd(18)} ${page.stub ? "骨架" : "完成"} · 代码 ${(page.codeBytes / 1000).toFixed(1)}k · 样式 ${(page.cssBytes / 1000).toFixed(1)}k · 渲染字数 ${page.renderedChars ?? "-"}`),
+    ] : []),
+    ...(summary.autofixes.length ? [`代码自动修复：${summary.autofixes.map((item) => `${item.stage}(${item.fixes.length})`).join("、")}`] : []),
     "-- 按阶段 --",
     ...summary.stages.map((stage) => `  ${stage.stage.padEnd(22)} ${s(stage.ms)}`),
     "-- 按 Agent（费用降序）--",

@@ -75,7 +75,7 @@ export function diagnosticsFor(output: string, files: string[]) {
 }
 
 // 运行报告写在预览服务那边（API 运行时不能写项目目录）。失败只打日志，不影响建站。
-export async function saveRunReport(payload: { runId: string; report: unknown; table: string; transcripts: Record<string, unknown> }) {
+export async function saveRunReport(payload: { runId: string; projectId: string; report: unknown; table: string; transcripts: Record<string, unknown> }) {
   try {
     const response = await fetch(`${previewServerUrl()}/runs`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) throw new Error(`HTTP ${response.status}：${(await response.text()).slice(0, 200)}`);

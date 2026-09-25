@@ -1,6 +1,6 @@
-import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
+import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
 import { classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, type Intent, type SitePlan, type SiteReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
-import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type ValidationResult } from "../../../../lib/preview-client";
+import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
 
 export const runtime = "nodejs";
@@ -66,13 +66,25 @@ export async function POST(request: Request) {
       const close = () => { if (!closed) { closed = true; try { controller.close(); } catch { /* client already gone */ } } };
       const run = new RunTelemetry(projectId, message);
       // 统一收尾：记录结果、打印汇总表、保存报告。返回一行给用户看的消耗摘要。
-      const finalizeRun = async (outcome: string, error?: string) => {
-        run.finalFiles = (await listWorkspaceFiles(root).catch(() => [])).filter((file) => file.path.startsWith("src/")).map((file) => ({ path: file.path, bytes: file.content.length }));
+      let lastInspection: InspectResult | undefined;
+      const finalizeRun = async (outcome: string, error?: string, review?: SiteReview) => {
+        const files = await listWorkspaceFiles(root).catch(() => []);
+        run.finalFiles = files.filter((file) => file.path.startsWith("src/")).map((file) => ({ path: file.path, bytes: file.content.length }));
+        if (run.intent !== "ask") {
+          const rendered = new Map((lastInspection?.routes ?? []).map((item) => [item.route, item.chars]));
+          run.quality = {
+            passed: outcome === "ok",
+            pages: pageMetrics(files).map((page) => ({ ...page, renderedChars: rendered.get(page.route) })),
+            reviewScore: review?.score,
+            reviewOk: review?.ok,
+            reviewIssues: review?.blockingIssues,
+          };
+        }
         run.finish(outcome, error);
         const summary = run.summary();
         const table = formatSummaryTable(summary);
         console.log(`\n${table}`);
-        const dir = await saveRunReport({ runId: run.runId, report: run.report(), table, transcripts: run.transcripts });
+        const dir = await saveRunReport({ runId: run.runId, projectId, report: run.report(), table, transcripts: run.transcripts });
         if (dir) console.log(`[run] 完整报告：${dir}`);
         const t = summary.totals;
         return { summary, line: `本次消耗约 ¥${t.costCny} · 用时 ${Math.round(summary.wallMs / 1000)} 秒 · 模型调用 ${t.llmCalls} 次 · 输入 ${Math.round(t.promptTokens / 1000)}k（缓存命中 ${Math.round(t.cacheHitRate * 100)}%）· 输出 ${Math.round(t.completionTokens / 1000)}k（思考占 ${Math.round(t.reasoningShareOfOutput * 100)}%）· 报告 ${run.runId}` };
@@ -148,6 +160,7 @@ export async function POST(request: Request) {
               await emit({ type: "inspect_started", label: "正在用浏览器逐页打开网站，检查白屏、报错和死链" });
               checkStarted = Date.now();
               const inspection = await inspectPreview(projectId);
+              lastInspection = inspection;
               run.checks.push({ round: repairRound, kind: "inspect", ok: inspection.ok, skipped: inspection.skipped, ms: Date.now() - checkStarted, problems: inspection.issues });
               await emit({ type: "inspect_done", ok: inspection.ok, label: inspection.skipped ? `浏览器检查已跳过：${inspection.reason || "不可用"}` : inspection.ok ? `浏览器检查通过（${inspection.routes?.length ?? 0} 个页面）` : `浏览器检查发现 ${inspection.issues.length} 个问题`, error: inspection.issues.slice(0, 3).join("；") });
               problems.push(...inspection.issues);
@@ -173,7 +186,13 @@ export async function POST(request: Request) {
 
           const files = await listWorkspaceFiles(root);
           const check = structuralCheck.ok ? (execution?.lastCheck || await checkWorkspace(root)) : structuralCheck;
-          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error);
+          // 评估用：新建网站结束时总要有一个审查分数。校验失败时循环里不会跑审查，
+          // 这里补一次，只记录分数，不再触发修复。
+          if (intent.intent === "new_site" && !qualityReview) {
+            enterStage("final_review");
+            qualityReview = await reviewSite(apiKey, projectId, message, root);
+          }
+          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error, qualityReview);
           const baseReply = execution?.reply || (validation.ok
             ? "构建、完整性检查和浏览器检查都通过了，没有发现需要修复的问题。如果你在页面上看到了具体问题，直接描述它（例如“手机上导航错位”），我会按修改来处理。"
             : "自动修复没有完全解决问题，剩余问题见下方。");

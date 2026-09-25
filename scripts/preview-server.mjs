@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -264,6 +264,106 @@ async function inspectSite(projectId, html, manifest) {
   };
 }
 
+// ---- 运行归档：成品快照、单文件 HTML、逐页渲染数据和整页截图 ----
+// 用 DevTools 协议截整页：保持真实视口高度（100vh 不变形），先滚动一遍触发
+// 懒加载和进入视口动画，再用 captureBeyondViewport 截出完整页面。
+async function withCdp(chrome, task) {
+  const profile = await mkdtemp(path.join(os.tmpdir(), "ai-site-cdp-"));
+  const args = ["--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--disable-extensions", "--disable-background-networking", "--disable-component-update", "--disable-sync", "--password-store=basic", "--use-mock-keychain", "--hide-scrollbars", `--user-data-dir=${profile}`, "--remote-debugging-port=0", "about:blank"];
+  if (typeof process.getuid === "function" && process.getuid() === 0) args.unshift("--no-sandbox");
+  const child = spawn(chrome, args, { stdio: "ignore" });
+  try {
+    let endpoint = "";
+    for (let i = 0; i < 100 && !endpoint; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      try { const [port, wsPath] = (await readFile(path.join(profile, "DevToolsActivePort"), "utf8")).trim().split("\n"); endpoint = `ws://127.0.0.1:${port}${wsPath}`; } catch { /* not ready yet */ }
+    }
+    if (!endpoint) throw new Error("无头浏览器没有启动");
+    const socket = new WebSocket(endpoint);
+    await new Promise((resolve, reject) => { socket.addEventListener("open", resolve, { once: true }); socket.addEventListener("error", reject, { once: true }); });
+    let nextId = 0;
+    const pending = new Map();
+    socket.addEventListener("message", (event) => {
+      const message = JSON.parse(String(event.data));
+      if (message.id && pending.has(message.id)) {
+        const { resolve, reject } = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) reject(new Error(message.error.message)); else resolve(message.result);
+      }
+    });
+    const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      pending.set(id, { resolve, reject });
+      socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+    try { return await task(send); } finally { socket.close(); }
+  } finally {
+    child.kill("SIGKILL");
+    await rm(profile, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function captureFullPage(send, url, width, height, mobile, file) {
+  const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+  const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+  try {
+    await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile }, sessionId);
+    await send("Page.navigate", { url }, sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    await send("Runtime.evaluate", { awaitPromise: true, expression: `(async () => { const wait = (ms) => new Promise((r) => setTimeout(r, ms)); for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.8) { scrollTo(0, y); await wait(120); } scrollTo(0, 0); await wait(600); })()` }, sessionId);
+    const metrics = await send("Page.getLayoutMetrics", {}, sessionId);
+    const size = metrics.cssContentSize || metrics.contentSize;
+    const fullHeight = Math.min(Math.ceil(size.height), 16000);
+    const { data } = await send("Page.captureScreenshot", { format: "jpeg", quality: 72, captureBeyondViewport: true, clip: { x: 0, y: 0, width, height: fullHeight, scale: 1 } }, sessionId);
+    await writeFile(file, Buffer.from(data, "base64"));
+    return fullHeight;
+  } finally {
+    await send("Target.closeTarget", { targetId }).catch(() => undefined);
+  }
+}
+
+async function archiveRun(runDir, projectId) {
+  const root = projectRoot(projectId);
+  const siteDir = path.join(runDir, "site");
+  await rm(siteDir, { recursive: true, force: true });
+  await mkdir(siteDir, { recursive: true });
+  for (const entry of ["src", "docs", "design", "index.html"]) {
+    await cp(path.join(root, entry), path.join(siteDir, entry), { recursive: true }).catch(() => undefined);
+  }
+  const html = await enqueue(projectId, () => buildPreviewCached(projectId, realpathSync(root))).then((result) => result.html).catch(() => "");
+  if (!html) return { archived: true, screenshots: 0, reason: "构建失败，未生成截图" };
+  await writeFile(path.join(runDir, "site.html"), html, "utf8");
+  const chrome = findChrome();
+  if (!chrome) return { archived: true, screenshots: 0, reason: "未找到浏览器" };
+  const manifest = await readFile(path.join(root, "src/app/site-manifest.ts"), "utf8").catch(() => "");
+  const routes = [...new Set([...manifest.matchAll(/path:\s*["'`]([^"'`]+)["'`]/g)].map((match) => normalizeRoute(match[1])))].filter((route) => route !== "/404");
+  if (!routes.includes("/")) routes.unshift("/");
+  const screensDir = path.join(runDir, "screens");
+  await mkdir(screensDir, { recursive: true });
+  const htmlUrl = pathToFileURL(path.join(runDir, "site.html")).href;
+  const render = {};
+  let screenshots = 0;
+  await withCdp(chrome, async (send) => {
+    for (const route of routes) {
+      const name = route === "/" ? "home" : route.replace(/^\//, "").replace(/[^a-zA-Z0-9-]+/g, "_");
+      render[route] = {};
+      for (const [label, width, height, mobile] of [["desktop", 1440, 900, false], ["mobile", 390, 844, true]]) {
+        try {
+          render[route][label] = await captureFullPage(send, `${htmlUrl}#${route}`, width, height, mobile, path.join(screensDir, `${name}-${label}.jpg`));
+          screenshots += 1;
+        } catch (error) {
+          render[route][label] = `失败：${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+    }
+  });
+  // 渲染后的正文字数（去掉导航和页脚），与运行时检查同一套口径
+  const inspection = await inspectSite(projectId, html, manifest).catch(() => null);
+  for (const item of inspection?.routes ?? []) render[item.route] = { ...(render[item.route] ?? {}), chars: item.chars, errors: item.errors };
+  await writeFile(path.join(runDir, "render.json"), JSON.stringify(render, null, 2), "utf8");
+  return { archived: true, screenshots };
+}
+
 function errorPage(message) {
   const escaped = message.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>预览构建失败</title><style>body{margin:0;padding:48px;font:16px/1.7 system-ui;color:#3d342c;background:#f8f5ef}main{max-width:720px;margin:auto;padding:32px;border:1px solid #e5d9cc;border-radius:20px;background:#fff}h1{font-size:22px}pre{white-space:pre-wrap;color:#8b4935}</style></head><body><main><h1>当前项目暂时无法预览</h1><p>系统已把完整的 TypeScript 或构建诊断交给 Agent；修复成功后会自动重新展示。</p><pre>${escaped}</pre></main></body></html>`;
@@ -337,11 +437,34 @@ const server = createServer(async (request, response) => {
         await writeFile(path.join(runDir, "transcripts", `${agent.replace(/[\\/:*?"<>|\s]/g, "_")}.json`), JSON.stringify(messages, null, 2), "utf8");
       }
       await writeFile(path.join(runsBase, "latest.txt"), runId, "utf8");
+      // 先把成品源码复制下来（很快），截图在后台完成，不拖慢用户看到结果。
+      const projectId = String(payload.projectId || "");
+      if (projectId) {
+        archiveRun(runDir, projectId)
+          .then((result) => console.log(`[run] ${runId} 已归档：${result.screenshots} 张截图${result.reason ? `（${result.reason}）` : ""}`))
+          .catch((error) => console.warn(`[run] ${runId} 归档失败：${error instanceof Error ? error.message : error}`));
+      }
       response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ ok: true, dir: runDir }));
     } catch (error) {
       response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
       response.end(error instanceof Error ? error.message : "保存运行报告失败");
+    }
+    return;
+  }
+  if (url.pathname === "/runs/archive" && request.method === "POST") {
+    // 手动归档某个项目的当前状态到指定运行目录（用于补齐基线数据）。
+    try {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const runDir = path.join(runsBase, String(payload.runId || "").replace(/[^a-zA-Z0-9_-]/g, "-"));
+      const result = await archiveRun(runDir, String(payload.projectId || "coffee-studio"));
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify(result));
+    } catch (error) {
+      response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      response.end(error instanceof Error ? error.message : "归档失败");
     }
     return;
   }

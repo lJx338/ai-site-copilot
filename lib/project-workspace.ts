@@ -303,6 +303,44 @@ export function analyzeProject(files: WorkspaceFile[]): ProjectIssue[] {
   return issues;
 }
 
+// 页面“拥有”的文件：页面本身，以及它（递归）导入的页面专属数据、区块和样式。
+// 全站共用的 src/content/site.ts 不算。
+export function ownedFiles(files: WorkspaceFile[], pageFile: string) {
+  const paths = new Set(files.map((file) => file.path));
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const owned = new Set<string>();
+  const queue = [pageFile];
+  while (queue.length) {
+    const current = queue.shift()!;
+    if (owned.has(current) || !byPath.has(current)) continue;
+    owned.add(current);
+    for (const specifier of localImports(byPath.get(current)!)) {
+      const resolved = resolveImport(paths, specifier);
+      if (resolved && resolved !== "src/content/site.ts" && /^src\/(content|components\/sections|styles\/pages)\//.test(resolved)) queue.push(resolved);
+    }
+  }
+  return [...owned];
+}
+
+// 评估用：每个页面的实现状态和代码量。
+export function pageMetrics(files: WorkspaceFile[]) {
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const app = byPath.get("src/app/App.tsx")?.content ?? "";
+  const routeOf = new Map([...app.matchAll(/["'`](\/[a-z0-9\-/]*)["'`]\s*:\s*(\w+)/g)].map((match) => [match[2], match[1]]));
+  return files.filter((file) => /^src\/pages\/[^/]+\.tsx$/.test(file.path) && file.path !== "src/pages/NotFoundPage.tsx").map((file) => {
+    const owned = ownedFiles(files, file.path);
+    const component = path.posix.basename(file.path, ".tsx");
+    return {
+      route: routeOf.get(component) ?? "?",
+      file: file.path,
+      stub: file.content.includes(STUB_MARKER),
+      codeBytes: owned.filter((item) => /\.tsx?$/.test(item)).reduce((total, item) => total + (byPath.get(item)?.content.length ?? 0), 0),
+      cssBytes: owned.filter((item) => item.endsWith(".css")).reduce((total, item) => total + (byPath.get(item)?.content.length ?? 0), 0),
+      files: owned.length,
+    };
+  });
+}
+
 // 页面 Agent 只需要关心自己负责的文件及其导入的本地文件。
 export function pageIssues(files: WorkspaceFile[], pageFile: string, minChars = 2500) {
   const paths = new Set(files.map((file) => file.path));
