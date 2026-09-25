@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   analyzeProject,
   applyWorkspacePatch,
+  autoFixProject,
   checkWorkspace,
   inspectContentQuality,
   listWorkspaceFiles,
@@ -727,6 +728,13 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   }
 }
 
+// 代码自动修复，并把修了什么记进运行报告。
+export async function applyAutoFixes(root: string, stage: string) {
+  const fixes = await autoFixProject(root).catch(() => [] as string[]);
+  if (fixes.length) currentRun()?.autofixes.push({ stage, fixes });
+  return fixes;
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, task: (item: T) => Promise<R>) {
   const results = new Array<R>(items.length);
   let next = 0;
@@ -763,6 +771,7 @@ async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) 
     allows: (file) => allowed.includes(file) || file.startsWith("src/layouts/") || (file.startsWith("src/components/") && !file.startsWith("src/components/sections/")),
   };
   const verify = async () => {
+    await applyAutoFixes(root, "verify:全站基础");
     const current = await listWorkspaceFiles(root);
     const paths = new Set(current.map((file) => file.path));
     const issues = analyzeProject(current).filter((issue) => issue.severity === "error" && !issue.file.startsWith("src/pages/")).map((issue) => issue.message);
@@ -800,6 +809,7 @@ async function runPage(context: ExecutionContext, page: PlannedPage, planned: Pl
     allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/"),
   };
   const verify = async () => {
+    await applyAutoFixes(root, `verify:${page.name}`);
     const issues = pageIssues(await listWorkspaceFiles(root), page.file);
     issues.push(...await typeErrors(projectId, root, (line) => owned(line.split("(")[0])));
     return issues;
@@ -854,6 +864,7 @@ async function executeNewSite(context: ExecutionContext) {
 }
 
 async function projectVerify(projectId: string, root: string) {
+  await applyAutoFixes(root, "verify:修复");
   const issues = analyzeProject(await listWorkspaceFiles(root)).filter((issue) => issue.severity === "error").map((issue) => issue.message);
   issues.push(...await typeErrors(projectId, root, () => true));
   return issues.slice(0, 30);

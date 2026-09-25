@@ -101,6 +101,48 @@ function jsString(value: string) {
   return JSON.stringify(value);
 }
 
+const APP_ROUTES_MARKER = "const routes: Record<string, ComponentType>";
+
+// App.tsx 由代码按页面清单生成，路由表和页面文件一一对应。
+async function writeAppRoutes(root: string, planned: PlannedPage[]) {
+  const imports = planned.map((page) => `import ${page.component} from "../pages/${page.component}";`).join("\n");
+  const routeMap = planned.map((page) => `  ${jsString(page.route)}: ${page.component},`).join("\n");
+  const app = `import type { ComponentType } from "react";\nimport SiteLayout from "../layouts/SiteLayout";\nimport { useRouter } from "./router";\n${imports}\nimport NotFoundPage from "../pages/NotFoundPage";\n\n// 每个路由都必须在这里注册；未注册的地址显示 404，而不是悄悄回到首页。\n${APP_ROUTES_MARKER} = {\n${routeMap}\n};\n\nexport default function App() {\n  const { path } = useRouter();\n  const Page = routes[path] ?? NotFoundPage;\n  return <SiteLayout><Page /></SiteLayout>;\n}\n`;
+  await writeFile(path.join(root, "src/app/App.tsx"), app, "utf8");
+}
+
+// 用代码修复机械性问题，不花模型费用。只处理有唯一正确答案的情况：
+// - 导入了不存在的样式文件：创建空样式文件（页面照常渲染，样式可以之后补）
+// - manifest 声明了、但 App.tsx 没注册的路由：按 manifest 重新生成路由表
+//   （只在 App.tsx 仍是系统生成的格式、且对应页面文件都存在时才重写）
+export async function autoFixProject(root: string) {
+  const fixes: string[] = [];
+  const files = await listWorkspaceFiles(root);
+  const paths = new Set(files.map((file) => file.path));
+  for (const file of files.filter((item) => item.path.startsWith("src/") && /\.tsx?$/.test(item.path))) {
+    for (const specifier of localImports(file)) {
+      if (!specifier.endsWith(".css") || !specifier.startsWith("src/styles/") || paths.has(specifier)) continue;
+      const target = safeWorkspacePath(root, specifier);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, `/* 系统自动创建：${file.path} 导入了这个样式文件，但它还没有被写入。 */\n`, "utf8");
+      paths.add(specifier);
+      fixes.push(`创建了缺失的样式文件 ${specifier}`);
+    }
+  }
+  const app = files.find((file) => file.path === "src/app/App.tsx")?.content ?? "";
+  const routes = manifestRoutes(files).filter((route) => route !== "/404");
+  const missing = routes.filter((route) => route !== "/" && !app.includes(`"${route}"`) && !app.includes(`'${route}'`));
+  if (missing.length && app.includes(APP_ROUTES_MARKER)) {
+    const manifest = files.find((file) => file.path === "src/app/site-manifest.ts")?.content ?? "";
+    const planned = planPages(routes.map((route) => ({ route, name: manifest.match(new RegExp(`path:\\s*["'\`]${route}["'\`]\\s*,\\s*label:\\s*["'\`]([^"'\`]+)`))?.[1] ?? route, goal: "" })));
+    if (planned.every((page) => paths.has(page.file))) {
+      await writeAppRoutes(root, planned);
+      fixes.push(`按 site-manifest.ts 重新生成了 App.tsx 路由表（补上 ${missing.join("、")}）`);
+    }
+  }
+  return fixes;
+}
+
 // 新建网站时由代码而不是模型生成路由骨架：每个计划页面都有文件、
 // 都在 App.tsx 注册、都在 manifest 中出现。模型只负责填充内容，
 // 不会再出现“导航里有但路由没接”的死链。
@@ -116,10 +158,7 @@ export async function scaffoldSite(root: string, brand: string, pages: ScaffoldP
   }
   const manifest = `export const siteManifest = {\n  brand: ${jsString(brand || "品牌名称")},\n  routes: [\n${planned.map((page) => `    { path: ${jsString(page.route)}, label: ${jsString(page.name)} },`).join("\n")}\n  ],\n} as const;\n`;
   await writeFile(path.join(root, "src/app/site-manifest.ts"), manifest, "utf8");
-  const imports = planned.map((page) => `import ${page.component} from "../pages/${page.component}";`).join("\n");
-  const routeMap = planned.map((page) => `  ${jsString(page.route)}: ${page.component},`).join("\n");
-  const app = `import type { ComponentType } from "react";\nimport SiteLayout from "../layouts/SiteLayout";\nimport { useRouter } from "./router";\n${imports}\nimport NotFoundPage from "../pages/NotFoundPage";\n\n// 每个路由都必须在这里注册；未注册的地址显示 404，而不是悄悄回到首页。\nconst routes: Record<string, ComponentType> = {\n${routeMap}\n};\n\nexport default function App() {\n  const { path } = useRouter();\n  const Page = routes[path] ?? NotFoundPage;\n  return <SiteLayout><Page /></SiteLayout>;\n}\n`;
-  await writeFile(path.join(root, "src/app/App.tsx"), app, "utf8");
+  await writeAppRoutes(root, planned);
   for (const page of planned) {
     const stub = `// ${STUB_MARKER} 页面骨架，等待页面 Agent 实现。\nimport PageHero from "../components/site/PageHero";\n\nexport default function ${page.component}() {\n  return <PageHero eyebrow=${jsString(page.slug.toUpperCase())} title=${jsString(page.name)} description=${jsString(page.goal)} />;\n}\n`;
     await writeFile(path.join(root, page.file), stub, "utf8");

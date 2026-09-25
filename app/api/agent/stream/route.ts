@@ -1,5 +1,5 @@
 import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
-import { classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, type Intent, type SitePlan, type SiteReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
+import { applyAutoFixes, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, type Intent, type SitePlan, type SiteReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
 import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
 
@@ -136,6 +136,8 @@ export async function POST(request: Request) {
             const problems: string[] = [];
             let previewUnavailable = false;
             enterStage(`check_${repairRound}`);
+            const fixes = await applyAutoFixes(root, `check_${repairRound}`);
+            if (fixes.length) await emit({ type: "autofix", label: `代码自动修复了 ${fixes.length} 个问题`, error: fixes.slice(0, 3).join("；") });
             let checkStarted = Date.now();
             try {
               await syncWorkspaceToPreview(projectId, root);
