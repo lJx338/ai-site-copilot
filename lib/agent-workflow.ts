@@ -884,11 +884,13 @@ export async function applySiteImages(projectId: string, root: string, emit: Wor
   const changed = current !== content;
   if (changed) await writeFile(safeWorkspacePath(root, "src/content/images.ts"), content, "utf8");
   const stats = result.stats ?? [];
-  const failed = stats.filter((item) => item.source === "none");
+  // 按配置有意留空的（例如关闭了 AI 生图的产品图）不算失败
+  const skipped = stats.filter((item) => item.skipped);
+  const failed = stats.filter((item) => item.source === "none" && !item.skipped);
   await emit({
     type: "images_done",
     ok: failed.length === 0,
-    label: `配图完成：${result.slots ?? 0} 个图片位 · 图库 ${stats.filter((item) => item.source === "pexels" && !item.cached).length} 张 · AI ${stats.filter((item) => item.source === "ai" && !item.cached).length} 张 · 沿用 ${stats.filter((item) => item.cached).length} 张${failed.length ? ` · ${failed.length} 个未解析` : ""}`,
+    label: `配图完成：${result.slots ?? 0} 个图片位 · 图库 ${stats.filter((item) => item.source === "pexels" && !item.cached).length} 张 · AI ${stats.filter((item) => item.source === "ai" && !item.cached).length} 张 · 沿用 ${stats.filter((item) => item.cached).length} 张${skipped.length ? ` · 留空 ${skipped.length} 张（${skipped[0].error}）` : ""}${failed.length ? ` · ${failed.length} 个未解析` : ""}`,
     error: [...failed.map((item) => `${item.slot}：${item.error}`), ...stats.filter((item) => item.fallback && !item.cached).slice(0, 1).map((item) => `改用备选来源：${item.fallback}`), ...(result.duplicates?.length ? [`重复的图片位 ID：${result.duplicates.join("、")}`] : [])].slice(0, 3).join("；"),
   });
   return { changed };

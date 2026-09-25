@@ -118,7 +118,7 @@ export class RunTelemetry {
   // 代码层面的自动修复（不花模型费用），以及用于和其他运行对比的质量指标
   autofixes: Array<{ stage: string; fixes: string[] }> = [];
   // 图片解析：每个图片位的来源（图库 / AI / 未解析）、是否沿用缓存、耗时
-  images: Array<{ stage: string; slot: string; route?: string; source: string; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string }> = [];
+  images: Array<{ stage: string; slot: string; route?: string; source: string; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string; skipped?: boolean }> = [];
   quality?: {
     passed: boolean;
     pages: Array<{ route: string; file: string; stub: boolean; codeBytes: number; cssBytes: number; files: number; renderedChars?: number }>;
@@ -253,7 +253,7 @@ export class RunTelemetry {
         // 同一图片位可能在多轮里出现，取最后一次的结果
         const latest = new Map(this.images.map((item) => [item.slot, item]));
         const items = [...latest.values()];
-        return { slots: items.length, pexels: items.filter((item) => item.source === "pexels").length, ai: items.filter((item) => item.source === "ai").length, failed: items.filter((item) => item.source === "none").length, newlyResolved: this.images.filter((item) => !item.cached && item.source !== "none").length, ms: this.images.reduce((total, item) => total + item.ms, 0), failures: items.filter((item) => item.error).map((item) => `${item.slot}：${item.error}`).slice(0, 10), fallbacks: items.filter((item) => item.fallback).map((item) => `${item.slot}：${item.fallback}`).slice(0, 10) };
+        return { slots: items.length, pexels: items.filter((item) => item.source === "pexels").length, ai: items.filter((item) => item.source === "ai").length, failed: items.filter((item) => item.source === "none" && !item.skipped).length, leftEmpty: items.filter((item) => item.skipped).length, newlyResolved: this.images.filter((item) => !item.cached && item.source !== "none").length, ms: this.images.reduce((total, item) => total + item.ms, 0), failures: items.filter((item) => item.error).map((item) => `${item.slot}：${item.error}`).slice(0, 10), fallbacks: items.filter((item) => item.fallback).map((item) => `${item.slot}：${item.fallback}`).slice(0, 10) };
       })(),
       quality: this.quality,
     };
@@ -317,7 +317,7 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
     ] : []),
     ...(summary.quality?.visualBefore ? [`视觉修复：${summary.quality.visualBefore.overall} → ${summary.quality.visual?.overall ?? "-"} 分${summary.quality.visualFix?.reverted ? `（已恢复修复前版本：${summary.quality.visualFix.reverted}）` : ""}`] : []),
     ...(summary.quality?.visual && !summary.quality.visual.skipped ? [`视觉：${summary.quality.visual.overall} 分 · ${Object.entries(summary.quality.visual.scores).map(([key, value]) => `${key} ${value}`).join(" ")} · 浏览器检查必须修 ${summary.quality.visual.lintMust} 处`] : []),
-    ...(summary.images.slots ? [`图片：${summary.images.slots} 个图片位 · 图库 ${summary.images.pexels} · AI ${summary.images.ai} · 未解析 ${summary.images.failed} · 新解析 ${summary.images.newlyResolved} 张`] : []),
+    ...(summary.images.slots ? [`图片：${summary.images.slots} 个图片位 · 图库 ${summary.images.pexels} · AI ${summary.images.ai} · 留空 ${summary.images.leftEmpty} · 未解析 ${summary.images.failed} · 新解析 ${summary.images.newlyResolved} 张`] : []),
     ...(summary.autofixes.length ? [`代码自动修复：${summary.autofixes.map((item) => `${item.stage}(${item.fixes.length})`).join("、")}`] : []),
     "-- 按阶段 --",
     ...summary.stages.map((stage) => `  ${stage.stage.padEnd(22)} ${s(stage.ms)}`),

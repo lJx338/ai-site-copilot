@@ -101,7 +101,7 @@ export async function fetchScreens(projectId: string, maxTiles = 6): Promise<{ s
 }
 
 export type ImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai"; credit?: string; creditUrl?: string };
-export type ImageStat = { slot: string; route?: string; source: "pexels" | "ai" | "none"; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string };
+export type ImageStat = { slot: string; route?: string; source: "pexels" | "ai" | "none"; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string; skipped?: boolean };
 export type ImageResolveResult = { skipped?: boolean; reason?: string; slots?: number; duplicates?: string[]; manifest?: Record<string, ImageAsset>; stats?: ImageStat[]; ms?: number };
 
 // 让预览服务收集页面上的 <SiteImage> 图片位，从图库搜索或用 AI 生成。调用前需要先同步工作区。

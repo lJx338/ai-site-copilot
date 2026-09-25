@@ -664,7 +664,13 @@ async function resolveImages(projectId, style) {
       stats.push({ slot: slot.slot, route: slot.route, source: cached.asset.source, cached: true, ms: 0 });
       return;
     }
-    const order = slot.kind === "product" ? ["ai", "pexels"] : ["pexels", "ai"];
+    // IMAGE_AI=off：只用图库。产品图需要 AI 生成，图库找来的通用照片往往对不上具体产品，宁可先留空。
+    const aiEnabled = process.env.IMAGE_AI !== "off";
+    const order = slot.kind === "product" ? (aiEnabled ? ["ai", "pexels"] : []) : (aiEnabled ? ["pexels", "ai"] : ["pexels"]);
+    if (!order.length) {
+      stats.push({ slot: slot.slot, route: slot.route, source: "none", cached: false, ms: 0, skipped: true, error: "AI 生图已关闭（IMAGE_AI=off），产品图先留空" });
+      return;
+    }
     const errors = [];
     for (const source of order) {
       try {
