@@ -20,7 +20,9 @@ async function load(runId: string) {
   const render = existsSync(path.join(dir, "render.json")) ? JSON.parse(readFileSync(path.join(dir, "render.json"), "utf8")) as Record<string, { chars?: number; errors?: number }> : {};
   // 从归档的成品重新计算页面指标，基线和新运行使用同一口径
   const pages = existsSync(path.join(dir, "site/src/main.tsx")) ? pageMetrics(await listWorkspaceFiles(path.join(dir, "site"))) : [];
-  return { runId, dir, summary: report.summary, render, pages };
+  // 旧运行没有在流程里打分时，可以事后补一个 review.json
+  const review = existsSync(path.join(dir, "review.json")) ? JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8")) as { score?: number } : undefined;
+  return { runId, dir, summary: report.summary, render, pages, reviewScore: report.summary.quality?.reviewScore ?? review?.score };
 }
 
 const a = await load(baseId);
@@ -67,7 +69,7 @@ add("Agent 平均轮数", aa.avgTurns, ab.avgTurns, (v) => v.toFixed(1));
 add("页面已实现", implemented(a.pages), implemented(b.pages));
 add("页面代码总量 字符", sumCode(a.pages), sumCode(b.pages), k);
 add("渲染正文总字数", sumChars(a), sumChars(b), k);
-add("内容审查分数", a.summary.quality?.reviewScore ?? "-", b.summary.quality?.reviewScore ?? "-");
+add("内容审查分数", a.reviewScore ?? "-", b.reviewScore ?? "-");
 
 const width = [22, 18, 18, 8];
 const line = (cells: string[]) => cells.map((cell, index) => cell.padEnd(width[index])).join(" │ ");
