@@ -32,6 +32,8 @@ Agent 执行约束：每个写代码的 Agent 一开始就知道自己的轮数�
 
 评估：每次运行在 `.ai-site-copilot-workspaces/.runs/<runId>/` 归档成品（`site/`、单文件 `site.html`）、桌面和手机整页截图（`screens/`）和逐页渲染数据（`render.json`）。用 `npm run compare:runs -- <基线 runId> [新 runId]` 对比两次运行的费用、用时、Agent 行为、修复过程和页面质量。
 
+视觉评估：截图前会先滚动页面、关闭动画，并把 sticky/fixed 元素改回普通定位，避免整页截图错位。浏览器视觉检查会找出横向溢出、文字或图形被裁切、图片加载失败、对比度不足、手机上过小的文字和点击区域、过长的手机页面，分"必须修"和"建议修"两级。看图审查由 `deepseek-flash` 直接读取按屏切片的截图，从视觉层次、节奏、图片、排版、一致性、手机端 6 个维度打分并列出问题，整站约 ¥0.1。新建网站结束时自动运行，结果记入报告（目前只记录，不触发修复）。已有项目可以用 `npm run visual:review -- [runId]` 补做（同一站点多次打分会有约 ±3 分的波动），用 `npm run gallery -- <runA> [runB]` 生成截图对比页。
+
 内容策略：用户没提供的事实由 Agent 补全成可信、具体、全站一致的示例内容，并列在 `docs/content-todo.md` 里方便替换；页面上不允许出现占位写法。
 
 浏览器检查会依次查找 `CHROME_PATH`、Playwright 缓存里的 headless shell（最快）和系统安装的 Chrome/Chromium/Edge；都找不到时跳过，不阻塞建站。`DEEPSEEK_MAX_TOKENS` 是单次请求的输出上限（含思考，默认 128000，模型最多 384000），只用来防止失控，不用来压缩产出。**所有配置都要写在 `.env.local` 里**：API 运行在 Cloudflare Workers 运行时中，看不到在命令行里 `export` 或前缀传入的环境变量。

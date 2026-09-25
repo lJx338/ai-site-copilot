@@ -1,5 +1,5 @@
 import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
-import { applyAutoFixes, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, type Intent, type SitePlan, type SiteReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
+import { applyAutoFixes, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
 import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
 
@@ -67,7 +67,7 @@ export async function POST(request: Request) {
       const run = new RunTelemetry(projectId, message);
       // 统一收尾：记录结果、打印汇总表、保存报告。返回一行给用户看的消耗摘要。
       let lastInspection: InspectResult | undefined;
-      const finalizeRun = async (outcome: string, error?: string, review?: SiteReview) => {
+      const finalizeRun = async (outcome: string, error?: string, review?: SiteReview, visual?: VisualReview) => {
         const files = await listWorkspaceFiles(root).catch(() => []);
         run.finalFiles = files.filter((file) => file.path.startsWith("src/")).map((file) => ({ path: file.path, bytes: file.content.length }));
         if (run.intent !== "ask") {
@@ -78,6 +78,7 @@ export async function POST(request: Request) {
             reviewScore: review?.score,
             reviewOk: review?.ok,
             reviewIssues: review?.blockingIssues,
+            visual: visual ? { overall: visual.overall, scores: visual.scores, lintMust: visual.lintMust, lintShould: visual.lintShould, skipped: visual.skipped, pages: visual.pages.map((page) => ({ route: page.route, overall: page.overall, error: page.error, issues: page.issues })) } : undefined,
           };
         }
         run.finish(outcome, error);
@@ -194,7 +195,15 @@ export async function POST(request: Request) {
             enterStage("final_review");
             qualityReview = await reviewSite(apiKey, projectId, message, root);
           }
-          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error, qualityReview);
+          // 视觉审查（阶段 1 只记录分数，用来衡量视觉优化的效果；阶段 4 再接入修复）
+          let visual: VisualReview | undefined;
+          if (intent.intent === "new_site" && validation.ok) {
+            enterStage("visual_review");
+            await emit({ type: "stage", stage: "visual_review", label: "正在截图并看图审查视觉效果" });
+            visual = await visualReview(apiKey, projectId);
+            await emit({ type: "visual_review_done", ok: !visual.skipped, label: visual.skipped ? `视觉审查已跳过：${visual.skipped}` : `视觉审查 ${visual.overall} 分（图片 ${visual.scores.imagery}、节奏 ${visual.scores.rhythm}、手机 ${visual.scores.mobile}）` });
+          }
+          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error, qualityReview, visual);
           const baseReply = execution?.reply || (validation.ok
             ? "构建、完整性检查和浏览器检查都通过了，没有发现需要修复的问题。如果你在页面上看到了具体问题，直接描述它（例如“手机上导航错位”），我会按修改来处理。"
             : "自动修复没有完全解决问题，剩余问题见下方。");

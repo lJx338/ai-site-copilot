@@ -85,3 +85,17 @@ export async function saveRunReport(payload: { runId: string; projectId: string;
     return null;
   }
 }
+
+export type LintItem = { type: string; msg: string; count: number; samples: string[] };
+export type PageScreens = { route: string; viewport: "desktop" | "mobile"; fullHeight?: number; tiles: string[]; lint: { must: LintItem[]; should: LintItem[]; metrics: Record<string, number> }; error?: string };
+
+// 逐页视觉检查 + 截图切片（base64 JPEG）。预览服务不可用时返回 skipped。
+export async function fetchScreens(projectId: string, maxTiles = 6): Promise<{ skipped: boolean; reason?: string; pages: PageScreens[] }> {
+  try {
+    const response = await fetch(`${previewServerUrl()}/screens?projectId=${encodeURIComponent(projectId)}&maxTiles=${maxTiles}`);
+    if (!response.ok) return { skipped: true, reason: `HTTP ${response.status}`, pages: [] };
+    return await response.json() as { skipped: boolean; reason?: string; pages: PageScreens[] };
+  } catch (error) {
+    return { skipped: true, reason: error instanceof Error ? error.message : "视觉检查不可用", pages: [] };
+  }
+}

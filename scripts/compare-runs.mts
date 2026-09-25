@@ -22,7 +22,10 @@ async function load(runId: string) {
   const pages = existsSync(path.join(dir, "site/src/main.tsx")) ? pageMetrics(await listWorkspaceFiles(path.join(dir, "site"))) : [];
   // 旧运行没有在流程里打分时，可以事后补一个 review.json
   const review = existsSync(path.join(dir, "review.json")) ? JSON.parse(readFileSync(path.join(dir, "review.json"), "utf8")) as { score?: number } : undefined;
-  return { runId, dir, summary: report.summary, render, pages, reviewScore: report.summary.quality?.reviewScore ?? review?.score };
+  // 视觉审查：优先用运行内的结果，旧运行可以事后用 npm run visual:review -- <runId> 补一个 visual.json
+  const visualFile = existsSync(path.join(dir, "visual.json")) ? JSON.parse(readFileSync(path.join(dir, "visual.json"), "utf8")) as { overall: number; scores: Record<string, number>; lintMust: number } : undefined;
+  const visual = report.summary.quality?.visual ?? visualFile;
+  return { runId, dir, summary: report.summary, render, pages, reviewScore: report.summary.quality?.reviewScore ?? review?.score, visual };
 }
 
 const a = await load(baseId);
@@ -70,6 +73,9 @@ add("页面已实现", implemented(a.pages), implemented(b.pages));
 add("页面代码总量 字符", sumCode(a.pages), sumCode(b.pages), k);
 add("渲染正文总字数", sumChars(a), sumChars(b), k);
 add("内容审查分数", a.reviewScore ?? "-", b.reviewScore ?? "-");
+add("视觉总分（看图审查）", a.visual?.overall, b.visual?.overall, (v) => v.toFixed(1));
+for (const dimension of ["hierarchy", "rhythm", "imagery", "typography", "consistency", "mobile"]) add(`  视觉·${dimension}`, a.visual?.scores[dimension], b.visual?.scores[dimension], (v) => v.toFixed(1));
+add("浏览器检查·必须修", a.visual?.lintMust, b.visual?.lintMust);
 
 const width = [22, 18, 18, 8];
 const line = (cells: string[]) => cells.map((cell, index) => cell.padEnd(width[index])).join(" │ ");

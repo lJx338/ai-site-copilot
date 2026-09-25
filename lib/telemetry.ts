@@ -123,6 +123,15 @@ export class RunTelemetry {
     reviewScore?: number;
     reviewOk?: boolean;
     reviewIssues?: string[];
+    // 看图审查：总分、6 个维度、浏览器检查问题数，以及每页分数和问题
+    visual?: {
+      overall: number;
+      scores: Record<string, number>;
+      lintMust: number;
+      lintShould: number;
+      pages: Array<{ route: string; overall: number; issues: Array<{ severity: string; viewport: string; section: string; problem: string; fix: string }>; error?: string }>;
+      skipped?: string;
+    };
   };
   private seq = 0;
   private currentStage?: { stage: string; startedMs: number };
@@ -295,6 +304,7 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
       `质量：${summary.quality.passed ? "验收通过" : "验收未通过"} · 页面 ${summary.quality.pages.filter((page) => !page.stub).length}/${summary.quality.pages.length} 已实现 · 审查 ${summary.quality.reviewScore ?? "-"} 分`,
       ...summary.quality.pages.map((page) => `  ${page.route.padEnd(18)} ${page.stub ? "骨架" : "完成"} · 代码 ${(page.codeBytes / 1000).toFixed(1)}k · 样式 ${(page.cssBytes / 1000).toFixed(1)}k · 渲染字数 ${page.renderedChars ?? "-"}`),
     ] : []),
+    ...(summary.quality?.visual && !summary.quality.visual.skipped ? [`视觉：${summary.quality.visual.overall} 分 · ${Object.entries(summary.quality.visual.scores).map(([key, value]) => `${key} ${value}`).join(" ")} · 浏览器检查必须修 ${summary.quality.visual.lintMust} 处`] : []),
     ...(summary.autofixes.length ? [`代码自动修复：${summary.autofixes.map((item) => `${item.stage}(${item.fixes.length})`).join("、")}`] : []),
     "-- 按阶段 --",
     ...summary.stages.map((stage) => `  ${stage.stage.padEnd(22)} ${s(stage.ms)}`),

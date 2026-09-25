@@ -20,7 +20,7 @@ import {
 } from "./project-workspace";
 import { classifyWithJev } from "./intent-jev";
 import { currentRun, currentScope, deepseekCost, enterStage, withScope, type AgentRecord } from "./telemetry";
-import { syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type ValidationResult } from "./preview-client";
+import { fetchScreens, syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type PageScreens, type ValidationResult } from "./preview-client";
 import { templateFiles } from "./project-template";
 
 export type ChatMessage = {
@@ -445,6 +445,102 @@ function normalizeReview(value: unknown): SiteReview {
     blockingIssues: toStrings(source.blockingIssues),
     suggestions: toStrings(source.suggestions),
     evidence: toStrings(source.evidence),
+  };
+}
+
+// ---- 看图审查：deepseek-flash 支持图片输入，直接读渲染后的截图切片 ----
+export type VisualDimension = "hierarchy" | "rhythm" | "imagery" | "typography" | "consistency" | "mobile";
+export type VisualIssue = { severity: "must" | "should"; viewport: "desktop" | "mobile"; tile: number; section: string; problem: string; fix: string };
+export type PageVisualReview = { route: string; overall: number; scores: Record<VisualDimension, number>; strengths: string[]; issues: VisualIssue[]; lint: { must: number; should: number }; error?: string };
+export type VisualReview = { overall: number; scores: Record<VisualDimension, number>; pages: PageVisualReview[]; lintMust: number; lintShould: number; skipped?: string };
+
+const visualDimensions: VisualDimension[] = ["hierarchy", "rhythm", "imagery", "typography", "consistency", "mobile"];
+
+const visualReviewPrompt = `你是资深网页视觉设计评审，标准是 Framer / Webflow 精选模板的水准。你会看到同一个页面的桌面端截图（1440 宽，按屏切片，从上到下编号）和手机端截图（390 宽，同样编号），以及浏览器自动检查发现的客观问题。
+
+按以下 6 个维度各打 0–10 分，要严格：
+- hierarchy 视觉层次：标题、正文、按钮的主次是否一眼清楚，首屏是否有明确焦点
+- rhythm 留白与节奏：区块间距是否舒适，背景和版式是否有变化，还是一路相同的卡片网格
+- imagery 图片与图形：是否有高质量、与内容相关的图片或插画；纯文字和色块只能拿低分
+- typography 排版：字号阶梯、行宽、行高、字体搭配是否精致；等宽字体、过小或过密的文字扣分
+- consistency 一致性：配色、圆角、阴影、组件风格是否统一
+- mobile 手机端：排列、字号、点击区域、是否有裁切或溢出
+
+分数参照：10 = 可以直接作为 Framer 精选模板；7 = 专业可用但不出彩；5 = 普通企业模板；3 = 明显粗糙或有明显错误。
+overall 为 0–100 的综合分，不是简单平均，要反映整体观感。
+
+issues 只写具体、可执行的问题：指明 viewport、第几张切片（tile，从 1 开始）、哪个区块，说明问题和具体改法。页面坏掉、文字看不清、内容被裁切或溢出属于 must，其余审美改进属于 should。不要重复浏览器检查已经列出的问题，除非你有补充。
+
+只输出合法 JSON。字符串内部引用文字时用「」，不要使用英文双引号。格式：{"scores":{"hierarchy":0,"rhythm":0,"imagery":0,"typography":0,"consistency":0,"mobile":0},"overall":0,"strengths":[],"issues":[{"severity":"should","viewport":"desktop","tile":1,"section":"","problem":"","fix":""}]}`;
+
+function lintSummary(page: PageScreens | undefined) {
+  if (!page) return "无";
+  const lines = [...page.lint.must.map((item) => `[必须修] ${item.msg} ×${item.count}：${item.samples.slice(0, 2).join("；")}`), ...page.lint.should.map((item) => `[建议] ${item.msg} ×${item.count}`)];
+  return lines.length ? lines.join("\n") : "无";
+}
+
+async function reviewPageVisual(apiKey: string, route: string, desktop: PageScreens | undefined, mobile: PageScreens | undefined): Promise<PageVisualReview> {
+  const images = (screens: PageScreens | undefined, label: string) => (screens?.tiles ?? []).flatMap((tile, index) => [
+    { type: "text", text: `${label} 第 ${index + 1} 张` },
+    { type: "image_url", image_url: { url: `data:image/jpeg;base64,${tile}`, detail: "high" } },
+  ]);
+  const content = [
+    { type: "text", text: `页面路由：${route}\n\n浏览器检查（桌面）：\n${lintSummary(desktop)}\n\n浏览器检查（手机）：\n${lintSummary(mobile)}` },
+    ...images(desktop, "桌面端"),
+    ...images(mobile, "手机端"),
+  ];
+  // DeepSeek 的图片只能放在 user 消息里，内容是内容块数组。
+  const messages = [{ role: "system", content: visualReviewPrompt }, { role: "user", content }] as unknown as ChatMessage[];
+  const lint = { must: [desktop, mobile].reduce((total, page) => total + (page?.lint.must.reduce((sum, item) => sum + item.count, 0) ?? 0), 0), should: [desktop, mobile].reduce((total, page) => total + (page?.lint.should.reduce((sum, item) => sum + item.count, 0) ?? 0), 0) };
+  const empty = Object.fromEntries(visualDimensions.map((dimension) => [dimension, 0])) as Record<VisualDimension, number>;
+  try {
+    let parsed: { scores?: Record<string, unknown>; overall?: unknown; strengths?: unknown; issues?: unknown } | undefined;
+    // 偶尔会返回不合法的 JSON（多是字符串里没转义的引号），最多试 3 次
+    for (let attempt = 0; attempt < 3 && !parsed; attempt += 1) {
+      let reply: DeepSeekReply;
+      try {
+        reply = await deepSeekRequest(apiKey, messages, { responseFormat: { type: "json_object" }, purpose: "visual_review" });
+      } catch (error) {
+        // 以防思考模式不支持图片输入：关闭思考再试一次
+        if (!/HTTP 400/.test(error instanceof Error ? error.message : "")) throw error;
+        reply = await deepSeekRequest(apiKey, messages, { responseFormat: { type: "json_object" }, purpose: "visual_review", thinking: { type: "disabled" } });
+      }
+      try { parsed = JSON.parse(reply.message.content || "{}") as typeof parsed; } catch (error) { if (attempt === 2) throw error; }
+    }
+    if (!parsed) throw new Error("视觉审查没有返回有效 JSON");
+    const scores = Object.fromEntries(visualDimensions.map((dimension) => [dimension, Math.max(0, Math.min(10, Number(parsed.scores?.[dimension]) || 0))])) as Record<VisualDimension, number>;
+    const issues = (Array.isArray(parsed.issues) ? parsed.issues : []).map((item) => {
+      const issue = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+      return {
+        severity: issue.severity === "must" ? "must" : "should",
+        viewport: issue.viewport === "mobile" ? "mobile" : "desktop",
+        tile: Number(issue.tile) || 1,
+        section: String(issue.section ?? ""),
+        problem: String(issue.problem ?? ""),
+        fix: String(issue.fix ?? ""),
+      } as VisualIssue;
+    }).filter((issue) => issue.problem);
+    return { route, overall: Math.max(0, Math.min(100, Number(parsed.overall) || 0)), scores, strengths: stringArray(parsed.strengths), issues, lint };
+  } catch (error) {
+    return { route, overall: 0, scores: empty, strengths: [], issues: [], lint, error: error instanceof Error ? error.message.slice(0, 300) : String(error) };
+  }
+}
+
+// 整站视觉审查：浏览器客观检查 + 逐页看图打分。页面之间并行。
+export async function visualReview(apiKey: string, projectId: string, maxTiles = 6): Promise<VisualReview> {
+  const empty = Object.fromEntries(visualDimensions.map((dimension) => [dimension, 0])) as Record<VisualDimension, number>;
+  const screens = await fetchScreens(projectId, maxTiles);
+  if (screens.skipped || !screens.pages.length) return { overall: 0, scores: empty, pages: [], lintMust: 0, lintShould: 0, skipped: screens.reason || "没有可审查的页面" };
+  const routes = [...new Set(screens.pages.map((page) => page.route))];
+  const pages = await mapLimit(routes, 3, (route) => reviewPageVisual(apiKey, route, screens.pages.find((page) => page.route === route && page.viewport === "desktop"), screens.pages.find((page) => page.route === route && page.viewport === "mobile")));
+  const scored = pages.filter((page) => !page.error);
+  const mean = (values: number[]) => values.length ? Number((values.reduce((total, value) => total + value, 0) / values.length).toFixed(1)) : 0;
+  return {
+    overall: mean(scored.map((page) => page.overall)),
+    scores: Object.fromEntries(visualDimensions.map((dimension) => [dimension, mean(scored.map((page) => page.scores[dimension]))])) as Record<VisualDimension, number>,
+    pages,
+    lintMust: pages.reduce((total, page) => total + page.lint.must, 0),
+    lintShould: pages.reduce((total, page) => total + page.lint.should, 0),
   };
 }
 

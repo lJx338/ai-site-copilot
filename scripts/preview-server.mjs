@@ -303,23 +303,160 @@ async function withCdp(chrome, task) {
   }
 }
 
-async function captureFullPage(send, url, width, height, mobile, file) {
+// 截图前的页面准备：滚动一遍触发懒加载和进入视口动画，然后关闭动画、把 sticky/fixed
+// 元素改回普通定位——整页截图时它们会被画在错误的位置（例如 Header 压在首屏中间）。
+const PREPARE_PAGE = `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.8) { scrollTo(0, y); await wait(120); }
+  scrollTo(0, 0); await wait(500);
+  const style = document.createElement("style");
+  style.textContent = "*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;transition:none!important;scroll-behavior:auto!important}";
+  document.head.appendChild(style);
+  for (const el of document.querySelectorAll("body *")) {
+    const position = getComputedStyle(el).position;
+    if (position === "fixed" || position === "sticky") el.style.setProperty("position", position === "fixed" ? "absolute" : "relative", "important");
+  }
+  await wait(200);
+})()`;
+
+// 浏览器里的客观视觉检查。按问题类型汇总，每类最多给 4 个样例，避免刷屏。
+const VISUAL_LINT = `(() => {
+  const vw = document.documentElement.clientWidth, vh = innerHeight, mobile = vw < 600;
+  const must = new Map(), should = new Map();
+  const add = (map, type, msg, sample) => { const e = map.get(type) || { type, msg, count: 0, samples: [] }; e.count++; if (sample && e.samples.length < 4 && !e.samples.includes(sample)) e.samples.push(sample); map.set(type, e); };
+  const name = (n) => n ? n.tagName.toLowerCase() + (n.id ? "#" + n.id : "") + (typeof n.className === "string" && n.className.trim() ? "." + n.className.trim().split(/\\s+/).slice(0, 2).join(".") : "") : "";
+  const where = (el) => { const sec = el.closest("section, header, footer, nav, article"); const text = (el.innerText || el.getAttribute("aria-label") || el.getAttribute("alt") || "").trim().replace(/\\s+/g, " ").slice(0, 24); return [name(sec), name(el), text && "「" + text + "」"].filter(Boolean).join(" › "); };
+  const visible = (cs) => cs.display !== "none" && cs.visibility !== "hidden" && Number(cs.opacity) > 0.05;
+  const ancestor = (el, test) => { for (let p = el.parentElement; p && p !== document.body && p !== document.documentElement; p = p.parentElement) if (test(getComputedStyle(p))) return p; return null; };
+  const scroller = (el) => ancestor(el, (cs) => cs.overflowX === "auto" || cs.overflowX === "scroll");
+  const clipper = (el) => ancestor(el, (cs) => cs.overflowX === "hidden" || cs.overflowX === "clip");
+  const ownText = (el) => [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim().length > 1);
+  const color = (c) => { const m = String(c).match(/rgba?\\(([^)]+)\\)/); if (!m) return null; const p = m[1].split(/[\\s,\\/]+/).filter(Boolean).map(Number); return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; };
+  const lum = ({ r, g, b }) => { const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }; return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b); };
+  // 背景色：向上收集半透明图层直到遇到不透明背景，再像浏览器一样逐层叠加。
+  // 遇到背景图、渐变或毛玻璃时无法确定颜色，跳过对比度检查。
+  const background = (el) => {
+    const layers = [];
+    for (let p = el; p; p = p.parentElement) {
+      const cs = getComputedStyle(p);
+      if ((cs.backgroundImage && cs.backgroundImage !== "none") || (cs.backdropFilter && cs.backdropFilter !== "none")) return null;
+      const c = color(cs.backgroundColor);
+      if (c && c.a > 0.02) { layers.push(c); if (c.a >= 0.99) break; }
+    }
+    let base = { r: 255, g: 255, b: 255, a: 1 };
+    if (layers.length && layers[layers.length - 1].a >= 0.99) base = layers.pop();
+    for (const layer of layers.reverse()) base = { r: layer.r * layer.a + base.r * (1 - layer.a), g: layer.g * layer.a + base.g * (1 - layer.a), b: layer.b * layer.a + base.b * (1 - layer.a), a: 1 };
+    return base;
+  };
+  const docW = document.documentElement.scrollWidth;
+  const wide = [];
+  let smallText = 0, smallTargets = 0;
+  for (const el of document.querySelectorAll("body *")) {
+    const cs = getComputedStyle(el); if (!visible(cs)) continue;
+    const r = el.getBoundingClientRect(); if (r.width < 1 || r.height < 1) continue;
+    const tag = el.tagName.toLowerCase();
+    if (r.right > vw + 2 && !scroller(el)) wide.push({ el, over: r.right - vw });
+    const text = ownText(el);
+    if (text || tag === "svg" || tag === "img" || tag === "canvas") {
+      const clip = clipper(el);
+      if (clip && !scroller(el)) {
+        const c = clip.getBoundingClientRect();
+        const cut = Math.max(c.left - r.left, r.right - c.right);
+        if (cut > 6 && r.width < c.width * 3) {
+          if (text) add(must, "clipped-text", "文字被容器裁切，显示不全", where(el) + " 裁掉 " + Math.round(cut) + "px");
+          else add(should, "clipped-graphic", "图形或图片被容器裁切", where(el) + " 裁掉 " + Math.round(cut) + "px");
+        }
+      }
+    }
+    if (text) {
+      const fs = parseFloat(cs.fontSize);
+      if (mobile && fs < 12) { smallText++; add(should, "small-text", "手机上文字小于 12px", where(el) + " " + fs + "px"); }
+      const fg = color(cs.color), bg = background(el);
+      if (fg && bg && fg.a > 0.5) {
+        const a = lum(fg), b = lum(bg), ratio = (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+        const need = fs >= 24 || (fs >= 18.5 && Number(cs.fontWeight) >= 700) ? 3 : 4.5;
+        if (ratio < need - 1.5) add(must, "low-contrast", "文字与背景对比度过低，看不清", where(el) + " " + ratio.toFixed(1) + ":1");
+        else if (ratio < need) add(should, "weak-contrast", "文字对比度偏低", where(el) + " " + ratio.toFixed(1) + ":1");
+      }
+    }
+    if (mobile && ["a", "button", "select"].includes(tag) && (r.height < 32 || r.width < 32)) { smallTargets++; add(should, "small-target", "手机上点击区域太小（小于 32px）", where(el) + " " + Math.round(r.width) + "×" + Math.round(r.height)); }
+  }
+  if (docW > vw + 2) {
+    wide.sort((x, y) => y.over - x.over);
+    add(must, "overflow", "页面出现横向滚动：有元素比屏幕宽", docW + "px > " + vw + "px");
+    for (const item of wide.slice(0, 3)) add(must, "overflow", "页面出现横向滚动：有元素比屏幕宽", where(item.el) + " 超出 " + Math.round(item.over) + "px");
+  }
+  for (const img of document.images) { if (!visible(getComputedStyle(img))) continue; if (!img.complete || img.naturalWidth === 0) add(must, "broken-image", "图片没有加载出来", (img.currentSrc || img.src || "").slice(0, 100)); }
+  const docH = document.documentElement.scrollHeight;
+  if (mobile && docH > vh * 16) add(should, "too-long", "手机页面过长", Math.round(docH / vh) + " 屏");
+  return JSON.stringify({ must: [...must.values()], should: [...should.values()], metrics: { width: vw, height: docH, screens: Number((docH / vh).toFixed(1)), images: document.images.length, smallText, smallTargets } });
+})()`;
+
+// 打开一个页面：准备 → 视觉检查 → 整页截图 → 按屏切片。返回切片的 base64，供看图审查使用。
+async function analyzePage(send, url, { width, height, mobile, fullFile, maxTiles = 0 }) {
   const { targetId } = await send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   try {
     await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile }, sessionId);
     await send("Page.navigate", { url }, sessionId);
     await new Promise((resolve) => setTimeout(resolve, 1200));
-    await send("Runtime.evaluate", { awaitPromise: true, expression: `(async () => { const wait = (ms) => new Promise((r) => setTimeout(r, ms)); for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.8) { scrollTo(0, y); await wait(120); } scrollTo(0, 0); await wait(600); })()` }, sessionId);
+    await send("Runtime.evaluate", { awaitPromise: true, expression: PREPARE_PAGE }, sessionId);
+    const lintResult = await send("Runtime.evaluate", { expression: VISUAL_LINT, returnByValue: true }, sessionId);
+    let lint = { must: [], should: [], metrics: {} };
+    try { lint = JSON.parse(lintResult.result.value); } catch { /* keep empty */ }
     const metrics = await send("Page.getLayoutMetrics", {}, sessionId);
     const size = metrics.cssContentSize || metrics.contentSize;
     const fullHeight = Math.min(Math.ceil(size.height), 16000);
-    const { data } = await send("Page.captureScreenshot", { format: "jpeg", quality: 72, captureBeyondViewport: true, clip: { x: 0, y: 0, width, height: fullHeight, scale: 1 } }, sessionId);
-    await writeFile(file, Buffer.from(data, "base64"));
-    return fullHeight;
+    if (fullFile) {
+      const { data } = await send("Page.captureScreenshot", { format: "jpeg", quality: 72, captureBeyondViewport: true, clip: { x: 0, y: 0, width, height: fullHeight, scale: 1 } }, sessionId);
+      await writeFile(fullFile, Buffer.from(data, "base64"));
+    }
+    const tiles = [];
+    for (let y = 0; y < fullHeight && tiles.length < maxTiles; y += height) {
+      const { data } = await send("Page.captureScreenshot", { format: "jpeg", quality: 70, captureBeyondViewport: true, clip: { x: 0, y, width, height: Math.min(height, fullHeight - y), scale: 1 } }, sessionId);
+      tiles.push(data);
+    }
+    return { fullHeight, lint, tiles };
   } finally {
     await send("Target.closeTarget", { targetId }).catch(() => undefined);
   }
+}
+
+const VIEWPORTS = [["desktop", 1440, 900, false], ["mobile", 390, 844, true]];
+
+function routeFileName(route) {
+  return route === "/" ? "home" : route.replace(/^\//, "").replace(/[^a-zA-Z0-9-]+/g, "_");
+}
+
+function routesFromManifest(manifest) {
+  const routes = [...new Set([...manifest.matchAll(/path:\s*["'`]([^"'`]+)["'`]/g)].map((match) => normalizeRoute(match[1])))].filter((route) => route !== "/404");
+  if (!routes.includes("/")) routes.unshift("/");
+  return routes;
+}
+
+// 对当前预览逐页做视觉检查并截图切片。结果只放在内存里返回，供 API 做看图审查。
+async function screensForProject(projectId, maxTiles) {
+  const root = realpathSync(projectRoot(projectId));
+  const { html } = await buildPreviewCached(projectId, root);
+  const chrome = findChrome();
+  if (!chrome) return { skipped: true, reason: "未找到浏览器", pages: [] };
+  const manifest = await readFile(path.join(root, "src/app/site-manifest.ts"), "utf8").catch(() => "");
+  const file = path.join(os.tmpdir(), `ai-site-screens-${String(projectId).replace(/[^a-zA-Z0-9_-]/g, "-")}.html`);
+  await writeFile(file, html, "utf8");
+  const pages = [];
+  await withCdp(chrome, async (send) => {
+    for (const route of routesFromManifest(manifest)) {
+      for (const [viewport, width, height, mobile] of VIEWPORTS) {
+        try {
+          const result = await analyzePage(send, `${pathToFileURL(file).href}#${route}`, { width, height, mobile, maxTiles });
+          pages.push({ route, viewport, ...result });
+        } catch (error) {
+          pages.push({ route, viewport, error: error instanceof Error ? error.message : String(error), lint: { must: [], should: [], metrics: {} }, tiles: [] });
+        }
+      }
+    }
+  });
+  return { skipped: false, pages };
 }
 
 async function archiveRun(runDir, projectId) {
@@ -336,20 +473,25 @@ async function archiveRun(runDir, projectId) {
   const chrome = findChrome();
   if (!chrome) return { archived: true, screenshots: 0, reason: "未找到浏览器" };
   const manifest = await readFile(path.join(root, "src/app/site-manifest.ts"), "utf8").catch(() => "");
-  const routes = [...new Set([...manifest.matchAll(/path:\s*["'`]([^"'`]+)["'`]/g)].map((match) => normalizeRoute(match[1])))].filter((route) => route !== "/404");
-  if (!routes.includes("/")) routes.unshift("/");
+  const routes = routesFromManifest(manifest);
   const screensDir = path.join(runDir, "screens");
   await mkdir(screensDir, { recursive: true });
   const htmlUrl = pathToFileURL(path.join(runDir, "site.html")).href;
   const render = {};
   let screenshots = 0;
+  const lint = {};
   await withCdp(chrome, async (send) => {
     for (const route of routes) {
-      const name = route === "/" ? "home" : route.replace(/^\//, "").replace(/[^a-zA-Z0-9-]+/g, "_");
+      const name = routeFileName(route);
       render[route] = {};
-      for (const [label, width, height, mobile] of [["desktop", 1440, 900, false], ["mobile", 390, 844, true]]) {
+      lint[route] = {};
+      for (const [label, width, height, mobile] of VIEWPORTS) {
         try {
-          render[route][label] = await captureFullPage(send, `${htmlUrl}#${route}`, width, height, mobile, path.join(screensDir, `${name}-${label}.jpg`));
+          const result = await analyzePage(send, `${htmlUrl}#${route}`, { width, height, mobile, fullFile: path.join(screensDir, `${name}-${label}.jpg`), maxTiles: 12 });
+          render[route][label] = result.fullHeight;
+          lint[route][label] = result.lint;
+          await mkdir(path.join(screensDir, "tiles"), { recursive: true });
+          for (const [index, tile] of result.tiles.entries()) await writeFile(path.join(screensDir, "tiles", `${name}-${label}-${String(index + 1).padStart(2, "0")}.jpg`), Buffer.from(tile, "base64"));
           screenshots += 1;
         } catch (error) {
           render[route][label] = `失败：${error instanceof Error ? error.message : String(error)}`;
@@ -357,6 +499,7 @@ async function archiveRun(runDir, projectId) {
       }
     }
   });
+  await writeFile(path.join(runDir, "lint.json"), JSON.stringify(lint, null, 2), "utf8");
   // 渲染后的正文字数（去掉导航和页脚），与运行时检查同一套口径
   const inspection = await inspectSite(projectId, html, manifest).catch(() => null);
   for (const item of inspection?.routes ?? []) render[item.route] = { ...(render[item.route] ?? {}), chars: item.chars, errors: item.errors };
@@ -465,6 +608,20 @@ const server = createServer(async (request, response) => {
     } catch (error) {
       response.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
       response.end(error instanceof Error ? error.message : "归档失败");
+    }
+    return;
+  }
+  if (url.pathname === "/screens") {
+    // 视觉检查 + 截图切片（base64），供 API 调用看图审查。
+    const projectId = url.searchParams.get("projectId") || "coffee-studio";
+    const maxTiles = Math.max(0, Math.min(20, Number(url.searchParams.get("maxTiles") || 8)));
+    try {
+      const result = await enqueue(projectId, () => screensForProject(projectId, maxTiles));
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify(result));
+    } catch (error) {
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify({ skipped: true, reason: error instanceof Error ? error.message : "视觉检查失败", pages: [] }));
     }
     return;
   }
