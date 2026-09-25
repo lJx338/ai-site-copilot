@@ -309,12 +309,35 @@ async function withCdp(chrome, task) {
   }
 }
 
+// 等页面真正渲染出来再继续：冷启动的浏览器加载几 MB 的内联脚本可能要好几秒，
+// 固定等待会让第一个页面（通常是首页）还没渲染就被读取，导致首页图片位漏收、截图空白。
+const WAIT_FOR_APP = `(async () => {
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 100; i += 1) {
+    const root = document.getElementById("root");
+    if (document.readyState === "complete" && root && root.children.length && document.querySelector("main, section, header")) break;
+    await wait(100);
+  }
+  await wait(400);
+})()`;
+
+async function waitForApp(send, sessionId) {
+  await send("Runtime.evaluate", { awaitPromise: true, expression: WAIT_FOR_APP }, sessionId);
+}
+
 // 截图前的页面准备：滚动一遍触发懒加载和进入视口动画，然后关闭动画、把 sticky/fixed
 // 元素改回普通定位——整页截图时它们会被画在错误的位置（例如 Header 压在首屏中间）。
 const PREPARE_PAGE = `(async () => {
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  // 懒加载图片改为立即加载，并等全部图片加载完（最多 8 秒），否则截图里会出现灰色空框
+  for (const img of document.images) img.loading = "eager";
   for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.8) { scrollTo(0, y); await wait(120); }
-  scrollTo(0, 0); await wait(500);
+  scrollTo(0, 0);
+  await Promise.race([
+    Promise.all([...document.images].map((img) => img.complete ? null : new Promise((r) => { img.addEventListener("load", r, { once: true }); img.addEventListener("error", r, { once: true }); }))),
+    wait(8000),
+  ]);
+  await wait(300);
   const style = document.createElement("style");
   style.textContent = "*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;transition:none!important;scroll-behavior:auto!important}";
   document.head.appendChild(style);
@@ -407,7 +430,8 @@ async function analyzePage(send, url, { width, height, mobile, fullFile, maxTile
   try {
     await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile }, sessionId);
     await send("Page.navigate", { url }, sessionId);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForApp(send, sessionId);
     await send("Runtime.evaluate", { awaitPromise: true, expression: PREPARE_PAGE }, sessionId);
     const lintResult = await send("Runtime.evaluate", { expression: VISUAL_LINT, returnByValue: true }, sessionId);
     let lint = { must: [], should: [], metrics: {} };
@@ -555,7 +579,8 @@ async function collectImageSlots(projectId) {
       try {
         await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
         await send("Page.navigate", { url: `${pathToFileURL(file).href}#${route}` }, sessionId);
-        await new Promise((resolve) => setTimeout(resolve, 900));
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await waitForApp(send, sessionId);
         const result = await send("Runtime.evaluate", { expression: COLLECT_IMAGES, returnByValue: true }, sessionId);
         for (const item of JSON.parse(result.result.value || "[]")) {
           if (!item.slot) continue;
@@ -629,7 +654,9 @@ async function resolveImages(projectId, style) {
   const ordered = [...slots].sort((a, b) => Number(b.kind === "product") - Number(a.kind === "product"));
   await mapLimit(ordered, 4, async (slot) => {
     const itemStarted = Date.now();
-    const descriptor = `${slot.kind}|${slot.query}|${slot.prompt}|${slot.ratio}|${slot.kind === "product" || !slot.query ? style : ""}`;
+    // 产品图按图片位 ID 缓存（同一产品在不同页面的描述可能略有不同，但应该是同一张图）；
+    // 其他图片按描述缓存，描述变了才重新找图。
+    const descriptor = slot.kind === "product" ? `product|${slot.slot}|${slot.ratio}` : `${slot.kind}|${slot.query}|${slot.prompt}|${slot.ratio}|${!slot.query ? style : ""}`;
     const hash = createHash("sha1").update(descriptor).digest("hex").slice(0, 16);
     const cached = index[hash];
     if (cached && existsSync(path.join(dir, cached.file))) {

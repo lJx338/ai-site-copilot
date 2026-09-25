@@ -1,0 +1,7 @@
+/*
+ * 系统基础排版（由入口 main.tsx 引入，Agent 不修改）。
+ * 标题均衡换行、段落避免末行只剩一两个字，减少中文“孤字”和词组被拆开。
+ */
+h1, h2, h3, h4 { text-wrap: balance; }
+p, li, dd, blockquote, figcaption { text-wrap: pretty; }
+html { line-break: strict; -webkit-text-size-adjust: 100%; }
