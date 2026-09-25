@@ -20,7 +20,7 @@ import {
 } from "./project-workspace";
 import { classifyWithJev } from "./intent-jev";
 import { currentRun, currentScope, deepseekCost, enterStage, withScope, type AgentRecord } from "./telemetry";
-import { typecheckWorkspace } from "./preview-client";
+import { syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type ValidationResult } from "./preview-client";
 import { templateFiles } from "./project-template";
 
 export type ChatMessage = {
@@ -891,9 +891,17 @@ async function executeChange(context: ExecutionContext) {
   });
 }
 
+// 修复按“先便宜后昂贵”的顺序升级：
+// 1. 代码自动修复（零成本）
+// 2. 仍是骨架的页面：重跑该页面 Agent（它有完整的页面上下文，比通用修复可靠）
+// 3. 重新检查，只把真正剩下的问题和相关文件的完整内容交给修复 Agent；没剩下就不调用模型
 async function executeRepair(context: ExecutionContext, repairMessage: string) {
   const { apiKey, projectId, message, root, emit, history } = context;
-  // 骨架页说明页面 Agent 失败了，重新跑对应的页面 Agent 比让通用修复 Agent 从零写更可靠。
+  const events: string[] = [];
+  let toolCallCount = 0;
+  const fixes = await applyAutoFixes(root, "repair");
+  if (fixes.length) await emit({ type: "autofix", label: `代码自动修复了 ${fixes.length} 个问题`, error: fixes.slice(0, 3).join("；") });
+
   const files = await listWorkspaceFiles(root);
   const planned = planPages(manifestRoutes(files).map((route) => ({ route, name: route, goal: "" })));
   const manifest = files.find((file) => file.path === "src/app/site-manifest.ts")?.content ?? "";
@@ -904,20 +912,29 @@ async function executeRepair(context: ExecutionContext, repairMessage: string) {
     page.goal = planPage?.goal || "";
   }
   const stubPages = planned.filter((page) => files.find((file) => file.path === page.file)?.content.includes(STUB_MARKER));
-  const events: string[] = [];
-  let toolCallCount = 0;
   if (stubPages.length) {
     const outcomes = await runPages(context, stubPages, planned);
     for (const { outcome } of outcomes) { events.push(...outcome.events); toolCallCount += outcome.toolCallCount; }
   }
-  const implicated = [...new Set([...repairMessage.matchAll(/src\/[\w./-]+\.(?:tsx?|css)/g)].map((match) => match[0]))].slice(0, 8);
+
+  // 静态检查、类型检查和构建都可以立刻重跑；浏览器检查和内容审查的问题只能沿用上一轮的结论。
+  const current = await projectVerify(projectId, root);
+  const build = await syncWorkspaceToPreview(projectId, root).then(() => validatePreview(projectId)).catch(() => ({ ok: true } as ValidationResult));
+  const buildIssues = !build.ok && !/TypeScript 检查失败/.test(build.error ?? "") ? [`构建失败：${String(build.error ?? "").replace(/\x1b\[[0-9;]*m/g, "").slice(0, 1500)}`] : [];
+  const carried = repairMessage.split("\n").map((line) => line.replace(/^-\s*/, "").trim()).filter((line) => /^路由 |^内容审查：/.test(line));
+  const remaining = [...current, ...buildIssues, ...carried];
+  if (!remaining.length) {
+    return { reply: stubPages.length ? `已重新生成 ${stubPages.map((page) => page.name).join("、")}，检查通过。` : "代码自动修复后检查通过。", events, toolCallCount };
+  }
+  const implicated = [...new Set(remaining.join("\n").match(/src\/[\w./-]+\.(?:tsx?|css)/g) ?? [])].slice(0, 6);
   const outcome = await runAgent({
     apiKey, root, emit,
     tag: "修复",
-    tools: authoringTools,
-    maxTurns: 14,
-    system: `${executionPrompt}\n\n${contentPolicy}\n\n你现在处于修复阶段：优先修复下面列出的校验问题，不要重写没有问题的页面。`,
-    user: `项目 ID：${projectId}\n原始需求：\n${message}${historyBlock(history)}\n\n# 上一轮校验失败，请修复：\n${repairMessage}\n\n${await changeContext(root, implicated)}`,
+    tools: focusedTools,
+    maxTurns: 8,
+    mustWrite: implicated.slice(0, 3).join("、") || undefined,
+    system: `你是建站项目的修复 Agent。只修复下面列出的问题，不要重写没有问题的内容，不要改动与问题无关的文件。出问题的文件已经完整附在消息里，直接修改；第 3 轮之前必须完成写入。小改动用 apply_patch，大面积修改用 write_file。\n\n${contentPolicy}`,
+    user: `项目 ID：${projectId}\n原始需求：\n${message}${historyBlock(history)}\n\n# 需要修复的问题\n${remaining.map((issue) => `- ${issue}`).join("\n")}\n\n# 相关文件\n${await fileBundle(root, [...implicated, "src/app/site-manifest.ts", "src/app/App.tsx"], 40000)}`,
     verify: () => projectVerify(projectId, root),
   });
   return { reply: outcome.reply, events: [...events, ...outcome.events], toolCallCount: toolCallCount + outcome.toolCallCount };
