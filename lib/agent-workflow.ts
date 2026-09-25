@@ -608,6 +608,8 @@ type AgentOptions = {
   scope?: WriteScope;
   verify?: () => Promise<string[]>;
   maxVerifyRounds?: number;
+  // 轮数快用完时，提醒 Agent 必须先写出的文件（例如页面文件本身）
+  mustWrite?: string;
 };
 
 type AgentOutcome = { reply: string; events: string[]; toolCallCount: number; remainingIssues: string[] };
@@ -628,7 +630,13 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   const record: AgentRecord = { agent: agentName, stage: scope.stage, startedMs: run?.now() ?? 0, ms: 0, turns: 0, maxTurns: options.maxTurns, toolCalls: 0, failedToolCalls: 0, verifyRounds: 0, endedBy: "turn_limit", remainingIssues: [], promptTokensByTurn: [], writtenFiles: {} };
   const started = Date.now();
   const prefix = options.tag ? `${options.tag} · ` : "";
-  const messages: ChatMessage[] = [{ role: "system", content: options.system }, { role: "user", content: options.user }];
+  const canWrite = options.tools.some((tool) => tool.function.name === "write_file");
+  // 基线运行里 15 个 Agent 全部把轮数用完才停：一直在读文件、在思考里起草整页代码，
+  // 最后来不及写。所以一开始就告诉它预算，快用完时明确要求停止阅读、立即写入。
+  const budget = canWrite
+    ? `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话。每一轮都可以同时调用多个工具（例如一次读取多个文件、一次写入多个文件），请合并调用。需要的文件大多已经附在消息里，不要为了“参考写法”去读其他文件。最迟第 2 轮开始写文件${options.mustWrite ? `，并且最先写出 ${options.mustWrite}` : ""}。思考只用来规划结构，不要在思考里起草完整代码，代码直接写进 write_file。`
+    : `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话，每一轮都可以同时调用多个工具。`;
+  const messages: ChatMessage[] = [{ role: "system", content: `${options.system}${budget}` }, { role: "user", content: options.user }];
   const events: string[] = [];
   let reply = "";
   let toolCallCount = 0;
@@ -646,7 +654,7 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   try {
     for (let turn = 0; turn < turnLimit; turn += 1) {
       record.turns = turn + 1;
-      const { message: assistant, usage } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, maxTokens: 32000, purpose: "agent_turn" }));
+      const { message: assistant, usage, finishReason } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, maxTokens: 32000, purpose: "agent_turn" }));
       record.promptTokensByTurn.push(usage?.prompt_tokens ?? 0);
       messages.push(assistant);
       if (!assistant.tool_calls?.length) {
@@ -684,6 +692,16 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
           messages.push({ role: "tool", tool_call_id: call.id, content: `工具错误：${detail}` });
         }
       }
+      const notes: string[] = [];
+      if (finishReason === "length") notes.push("上一次输出超过长度上限被截断，写入的文件内容可能不完整。请把大文件拆成几个较小的文件分别写入，并检查刚才的写入是否成功。");
+      const remaining = turnLimit - (turn + 1);
+      if (canWrite && remaining > 0 && remaining <= 3) {
+        const target = options.mustWrite ? `尚未完成的文件（优先 ${options.mustWrite}）` : "尚未完成的修改";
+        notes.push(remaining === 1
+          ? `这是最后一轮。必须现在用 write_file 写出${target}，写完就结束回复，不要再读取任何文件。`
+          : `还剩 ${remaining} 轮。停止阅读，下一轮必须用 write_file 写出${target}。`);
+      }
+      if (notes.length) messages.push({ role: "user", content: notes.join("\n") });
     }
     if (!finished && options.verify) remainingIssues = await verify();
     return { reply, events, toolCallCount, remainingIssues };
