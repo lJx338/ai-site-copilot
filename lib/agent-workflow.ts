@@ -147,7 +147,7 @@ const foundationPrompt = `你是建站 Agent 的「全站基础」阶段。系�
 
 写入要求：
 - 第 1 轮就同时写出 tokens.css、design/tokens.json、src/content/site.ts 和 index.html；第 2 轮同时写出 globals.css、Header、Footer 和共享组件。
-- globals.css 一次写完整（控制在 25KB 以内），之后最多再用 apply_patch 修补 2 次，不要反复零碎修改。
+- globals.css 尽量一次写完整，避免反复零碎修改。
 - 不要修改 src/app/router.tsx、src/app/App.tsx 和 src/pages 下的文件。
 - 需要的文件都已附在消息里，不需要再读取其他文件。
 结束时用两三句话说明视觉方向和提供给页面的共享组件。`;
@@ -162,7 +162,7 @@ function pagePrompt(page: PlannedPage, routeList: string) {
 3. 页面专属样式写在 src/styles/pages/${page.slug}.css，并在页面文件里 import "../styles/pages/${page.slug}.css"。使用 tokens.css 的变量；类名统一加 "${page.slug}-" 前缀，避免与其他页面冲突。
 4. 需要拆分组件时，放在 src/components/sections/ 下，文件名以 ${prefix} 开头。不要修改其他任何文件（包括全局样式、Header、Footer 和共享组件）。
 5. 内部链接只能指向这些已注册路由：${routeList}。
-6. 写入顺序：第 1 轮就在同一轮里同时写出三个文件——${page.file}、src/content/${page.slug}.ts、src/styles/pages/${page.slug}.css。区块直接写在页面文件里即可，拆分组件不是必须的；绝不能只写数据或组件而把页面留成骨架。写完后系统会自动检查，有问题会告诉你。
+6. 写入顺序：最先写出 ${page.file}；src/content/${page.slug}.ts 和 src/styles/pages/${page.slug}.css 可以在同一轮或紧接着的下一轮写出。区块直接写在页面文件里即可，拆分组件不是必须的；绝不能只写数据或组件而把页面留成骨架。写完后系统会自动检查，有问题会告诉你。
 7. 结束时用两三句话说明页面结构和设计取舍。`;
 }
 
@@ -296,10 +296,11 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
   if (thinking.type === "enabled" && options.toolChoice !== undefined && options.toolChoice !== "auto") {
     throw new Error("当前 DeepSeek thinking 工具会话不支持强制指定工具，请改用 tool_choice=auto 或让模型自行选择工具。");
   }
-  // 推理内容也计入 max_tokens。上限过低时 JSON 和 write_file 参数会被截断，
-  // 这正是之前 PRD/设计 JSON 解析失败、页面计划为空的原因。
-  const outputCap = Number(process.env.DEEPSEEK_MAX_TOKENS || 32000);
-  let maxTokens = options.maxTokens ? Math.min(options.maxTokens, outputCap) : undefined;
+  // 思考内容也计入 max_tokens。上限不是用来压缩产出的：32k 的上限曾让 25–42% 的
+  // 费用花在被截断、只能重写的输出上。默认 128k（正常一页约 3 万）只防止极端失控，
+  // 模型最多支持 384k，可以用 DEEPSEEK_MAX_TOKENS 调整。
+  const outputCap = Number(process.env.DEEPSEEK_MAX_TOKENS || 128000);
+  let maxTokens = options.maxTokens ? Math.min(options.maxTokens, outputCap) : outputCap;
   for (let attempt = 0; ; attempt += 1) {
     meta.attempts = attempt + 1;
     const requestBody = {
@@ -347,10 +348,10 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
   }
 }
 
-async function requestJson(apiKey: string, messages: ChatMessage[], maxTokens: number, purpose: string) {
+async function requestJson(apiKey: string, messages: ChatMessage[], purpose: string) {
   let current = messages;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { message, finishReason } = await deepSeekRequest(apiKey, current, { responseFormat: { type: "json_object" }, maxTokens, purpose });
+    const { message, finishReason } = await deepSeekRequest(apiKey, current, { responseFormat: { type: "json_object" }, purpose });
     try { return JSON.parse(message.content || "") as Record<string, unknown>; } catch { /* retry below */ }
     const hint = finishReason === "length" ? "上一次输出过长被截断。请输出更精简的 JSON：每个字符串不超过 30 字，每个数组不超过 6 项。" : "上一次输出不是合法 JSON。请只输出一个合法 JSON object。";
     current = [...messages.slice(0, -1), { ...messages[messages.length - 1], content: `${messages[messages.length - 1].content}\n\n注意：${hint}` }];
@@ -358,8 +359,8 @@ async function requestJson(apiKey: string, messages: ChatMessage[], maxTokens: n
   throw new Error("需求规划没有返回有效的 JSON，请重试");
 }
 
-async function requestMarkdown(apiKey: string, messages: ChatMessage[], maxTokens: number, purpose: string) {
-  const { message } = await deepSeekRequest(apiKey, messages, { maxTokens, purpose });
+async function requestMarkdown(apiKey: string, messages: ChatMessage[], purpose: string) {
+  const { message } = await deepSeekRequest(apiKey, messages, { purpose });
   return (message.content || "").trim().replace(/^```(?:markdown|md)?\s*\n/i, "").replace(/\n```\s*$/, "").trim();
 }
 
@@ -463,7 +464,7 @@ export async function reviewSite(apiKey: string, projectId: string, message: str
     { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n当前项目文件：\n${sourceBundle}` },
   ];
   try {
-    const { message: assistant } = await deepSeekRequest(apiKey, messages, { responseFormat: { type: "json_object" }, maxTokens: 8000, purpose: "review" });
+    const { message: assistant } = await deepSeekRequest(apiKey, messages, { responseFormat: { type: "json_object" }, purpose: "review" });
     return normalizeReview(JSON.parse(assistant.content || "{}"));
   } catch (error) {
     return { ok: true, score: 0, blockingIssues: [], suggestions: [`质量审查未完成：${error instanceof Error ? error.message : "未知错误"}`], evidence: [] };
@@ -564,7 +565,7 @@ export async function createPlan(apiKey: string, projectId: string, message: str
   const sitemap = await requestJson(apiKey, [
     { role: "system", content: `${sitemapPrompt}${await loadSiteSkills(root, ["requirements"])}` },
     { role: "user", content: `项目 ID：${projectId}\n当前项目文件摘要：\n${projectSummary}\n\n当前路由清单：\n${manifest || "无"}\n\n已有 PRD（节选）：\n${previousPrd.slice(0, 6000) || "无"}${options.history ? `\n\n最近对话：\n${options.history}` : ""}\n\n用户需求：\n${message}` },
-  ], 16000, "plan");
+  ], "plan");
   const plan = normalizePlan(sitemap);
   // 意图识别已经确定是新建网站时，不让规划模型再改判成局部修改。
   if (options.forceNewSite) { plan.mode = "new_site"; plan.readOnly = false; }
@@ -579,13 +580,13 @@ export async function createPlan(apiKey: string, projectId: string, message: str
   const prdMarkdown = await requestMarkdown(apiKey, [
     { role: "system", content: `${prdPrompt}\n\n${contentPolicy}${await loadSiteSkills(root, ["requirements"])}` },
     { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n页面规划：\n${planJson}` },
-  ], 16000, "prd").catch(() => "");
+  ], "prd").catch(() => "");
   enterStage("design");
   await onStage?.("PRD 已完成，正在使用设计 Skill 推导 design.md");
   const designMarkdown = await requestMarkdown(apiKey, [
     { role: "system", content: `${designPrompt}\n\n${contentPolicy}${await loadSiteSkills(root, ["design-derivation"])}` },
     { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n页面规划：\n${planJson}\n\nPRD：\n${prdMarkdown || fallbackPrd(message, plan)}` },
-  ], 20000, "design").catch(() => "");
+  ], "design").catch(() => "");
   return { ...plan, prdMarkdown, designMarkdown };
 }
 
@@ -661,7 +662,7 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   // 基线运行里 15 个 Agent 全部把轮数用完才停：一直在读文件、在思考里起草整页代码，
   // 最后来不及写。所以一开始就告诉它预算，快用完时明确要求停止阅读、立即写入。
   const budget = canWrite
-    ? `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话。每一轮都可以同时调用多个工具（例如一次读取多个文件、一次写入多个文件），请合并调用。需要的文件大多已经附在消息里，不要为了“参考写法”去读其他文件。最迟第 2 轮开始写文件${options.mustWrite ? `，并且最先写出 ${options.mustWrite}` : ""}。思考只用来规划结构，不要在思考里起草完整代码，代码直接写进 write_file。`
+    ? `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话。每一轮都可以同时调用多个工具（例如一次读取多个文件、一次写入多个文件），请合并调用。需要的文件大多已经附在消息里，不要为了“参考写法”去读其他文件。最迟第 2 轮开始写文件${options.mustWrite ? `，并且最先写出 ${options.mustWrite}` : ""}。思考用来规划页面结构和关键设计决策，想得充分再动手；代码直接写进 write_file 即可，不必在思考里先完整写一遍。`
     : `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话，每一轮都可以同时调用多个工具。`;
   const messages: ChatMessage[] = [{ role: "system", content: `${options.system}${budget}` }, { role: "user", content: options.user }];
   const events: string[] = [];
@@ -681,9 +682,14 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   try {
     for (let turn = 0; turn < turnLimit; turn += 1) {
       record.turns = turn + 1;
-      const { message: assistant, usage, finishReason } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, maxTokens: 32000, purpose: "agent_turn", reasoningEffort: agentReasoningEffort() }));
+      const { message: assistant, usage, finishReason } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, purpose: "agent_turn", reasoningEffort: agentReasoningEffort() }));
       record.promptTokensByTurn.push(usage?.prompt_tokens ?? 0);
       messages.push(assistant);
+      if (!assistant.tool_calls?.length && finishReason === "length") {
+        // 输出被截断、没有产生任何工具调用：这不是“完成”，让它接着把文件写出来。
+        messages.push({ role: "user", content: "上一次输出超过长度上限被截断，没有写入任何文件。请直接用 write_file 写出文件；文件很大时可以拆成几个文件分别写入。" });
+        continue;
+      }
       if (!assistant.tool_calls?.length) {
         reply = assistant.content?.trim() || reply;
         if (!options.verify) { finished = true; record.endedBy = "reply"; break; }

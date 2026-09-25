@@ -34,7 +34,7 @@ Agent 执行约束：每个写代码的 Agent 一开始就知道自己的轮数�
 
 内容策略：用户没提供的事实由 Agent 补全成可信、具体、全站一致的示例内容，并列在 `docs/content-todo.md` 里方便替换；页面上不允许出现占位写法。
 
-浏览器检查会依次查找 `CHROME_PATH`、Playwright 缓存里的 headless shell（最快）和系统安装的 Chrome/Chromium/Edge；都找不到时跳过，不阻塞建站。`DEEPSEEK_MAX_TOKENS` 可以调整单次请求的输出上限（默认 32000）。
+浏览器检查会依次查找 `CHROME_PATH`、Playwright 缓存里的 headless shell（最快）和系统安装的 Chrome/Chromium/Edge；都找不到时跳过，不阻塞建站。`DEEPSEEK_MAX_TOKENS` 是单次请求的输出上限（含思考，默认 128000，模型最多 384000），只用来防止失控，不用来压缩产出。**所有配置都要写在 `.env.local` 里**：API 运行在 Cloudflare Workers 运行时中，看不到在命令行里 `export` 或前缀传入的环境变量。
 
 `pnpm run dev` 会同时启动工作台和本地预览构建服务：Vinext API 请求使用临时工作区，预览子进程把项目快照保存在被 Git 忽略的 `.ai-site-copilot-workspaces/.preview-workspaces`，每次请求开始时临时工作区会与快照完全对齐。可通过 `AI_WORKSPACE_ROOT` 指定 API 临时工作区、通过 `AI_PREVIEW_WORKSPACE_ROOT` 指定持久化预览工作区。
 

@@ -192,7 +192,7 @@ export class RunTelemetry {
       error: this.error,
       wallMs: (this.finishedAt ?? Date.now()) - this.startedAt,
       // 本次运行的关键配置，对比时用来区分实验组
-      config: { model: process.env.DEEPSEEK_MODEL || "deepseek-flash", agentReasoningEffort: process.env.AI_AGENT_REASONING_EFFORT || "high", intentProvider: process.env.TYPESAFE_API_KEY ? "jev" : "deepseek" },
+      config: { model: process.env.DEEPSEEK_MODEL || "deepseek-flash", agentReasoningEffort: process.env.AI_AGENT_REASONING_EFFORT || "high", maxOutputTokens: Number(process.env.DEEPSEEK_MAX_TOKENS || 128000), intentProvider: process.env.TYPESAFE_API_KEY ? "jev" : "deepseek" },
       pricing: { ...pricing, model: process.env.DEEPSEEK_MODEL || "deepseek-flash", peakPrices: peakPrices(process.env.DEEPSEEK_MODEL || "deepseek-flash"), peakCalls: deepseek.filter((call) => call.peak).length, offPeakCalls: deepseek.filter((call) => !call.peak).length },
       totals: {
         costCny: round(Object.values(costOf).reduce((total, value) => total + value, 0)),
