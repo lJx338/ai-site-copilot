@@ -34,7 +34,9 @@ Agent 执行约束：每个写代码的 Agent 一开始就知道自己的轮数�
 
 视觉评估：截图前会先滚动页面、关闭动画，并把 sticky/fixed 元素改回普通定位，避免整页截图错位。浏览器视觉检查会找出横向溢出、文字或图形被裁切、图片加载失败、对比度不足、手机上过小的文字和点击区域、过长的手机页面，分"必须修"和"建议修"两级。看图审查由 `deepseek-flash` 直接读取按屏切片的截图，从视觉层次、节奏、图片、排版、一致性、手机端 6 个维度打分并列出问题，整站约 ¥0.1。新建网站结束时自动运行，结果记入报告（目前只记录，不触发修复）。已有项目可以用 `npm run visual:review -- [runId]` 补做（同一站点多次打分会有约 ±3 分的波动），用 `npm run gallery -- <runA> [runB]` 生成截图对比页。
 
-配图：页面用 `<SiteImage slot kind query prompt ratio alt>` 声明需要什么图，不写图片地址。每轮校验前，预览服务在浏览器里渲染页面、收集所有 `data-image-*` 图片位，照片先搜 Pexels（`PEXELS_API_KEY`），产品图先用 Seedream 生成（`ARK_API_KEY`、`ARK_IMAGE_MODEL`、`ARK_IMAGE_URL`，每站最多 `IMAGE_AI_MAX` 张，默认 8；注意 plan 接口目前只接受 `doubao-seedream-5.0-pro`，`5.0-lite` 会返回 UnsupportedModel；单张约 30 秒）；一种来源失败就换另一种，原因会记进进度和报告。图片用 sharp 压成 WebP，保存在 `.ai-site-copilot-workspaces/.assets/<projectId>/`，按描述缓存，由预览服务的 `/assets/` 提供访问，地址写进 `src/content/images.ts`。Pexels 图片会显示摄影师署名和来源链接。设计文档的“图像风格”会拼进 AI 生图提示词，保证风格统一。
+配图：页面用 `<SiteImage slot kind query prompt ratio alt>` 声明需要什么图，不写图片地址。每轮校验前，预览服务在浏览器里渲染页面、收集所有 `data-image-*` 图片位，照片先搜 Pexels（`PEXELS_API_KEY`），产品图先用 Seedream 生成（`ARK_API_KEY`、`ARK_IMAGE_MODEL`、`ARK_IMAGE_URL`，每站最多 `IMAGE_AI_MAX` 张，默认 12，产品图优先；注意 plan 接口目前只接受 `doubao-seedream-5.0-pro`，`5.0-lite` 会返回 UnsupportedModel；单张约 30 秒）；一种来源失败就换另一种，原因会记进进度和报告。图片用 sharp 压成 WebP，保存在 `.ai-site-copilot-workspaces/.assets/<projectId>/`，按描述缓存，由预览服务的 `/assets/` 提供访问，地址写进 `src/content/images.ts`。Pexels 图片会显示摄影师署名和来源链接。设计文档的“图像风格”会拼进 AI 生图提示词，保证风格统一。
+
+区块库：模板里的 `src/components/blocks/` 提供 13 个做好版式、手机端、动效和配图的页面积木（Hero 三种变体、LogoCloud、StatsBand、FeatureGrid、SplitFeature、ProductGrid、Gallery、Testimonials、Steps、Pricing、Faq、CtaBand、ContactBlock），样式在 `src/styles/blocks.css`，只依赖 tokens.css 的变量名。目录和用法在 `skills/blocks/SKILL.md`，页面 Agent 预先拿到目录，优先组合区块、不合适时自己写；区块库、SiteImage 和图片清单对所有 Agent 只读。全站基础阶段必须保留模板里的全部令牌名。用全部区块拼成的样例页在默认主题下视觉审查约 80 分，生成网站目前约 66 分。
 
 内容策略：用户没提供的事实由 Agent 补全成可信、具体、全站一致的示例内容，并列在 `docs/content-todo.md` 里方便替换；页面上不允许出现占位写法。
 

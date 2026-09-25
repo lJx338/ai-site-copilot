@@ -337,6 +337,8 @@ export function analyzeProject(files: WorkspaceFile[]): ProjectIssue[] {
   // 写了数据却没用上
   const importedByOthers = new Set(codeFiles.flatMap((file) => localImports(file).map((specifier) => resolveImport(paths, specifier)).filter((item): item is string => !!item)));
   for (const file of files.filter((item) => /^src\/(content|components)\/.+\.tsx?$/.test(item.path))) {
+    // 系统提供的区块库和图片组件，没用到也不算问题
+    if (file.path.startsWith("src/components/blocks/") || file.path === "src/components/ui/SiteImage.tsx" || file.path === "src/content/images.ts") continue;
     if (!importedByOthers.has(file.path)) issues.push({ file: file.path, severity: file.path.startsWith("src/content/") ? "error" : "warning", message: `${file.path} 没有被任何页面或组件导入，${file.path.startsWith("src/content/") ? "数据没有展示到网站上" : "是未使用的组件"}` });
   }
   return issues;

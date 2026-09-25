@@ -5,3 +5,8 @@
 .site-image__placeholder { position: absolute; inset: 0; display: block; background: linear-gradient(135deg, rgb(128 128 128 / 18%), rgb(128 128 128 / 6%)); }
 .site-image__credit { position: absolute; right: 8px; bottom: 8px; max-width: calc(100% - 16px); padding: 2px 8px; border-radius: 999px; background: rgb(0 0 0 / 60%); font-size: 12px; line-height: 1.6; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .site-image__credit a { color: #fff; text-decoration: none; }
+/* 有鼠标的设备上署名悬停时才显示，页面更干净；触屏设备上一直显示 */
+@media (hover: hover) {
+  .site-image__credit { opacity: 0; transition: opacity .2s ease; }
+  .site-image:hover .site-image__credit, .site-image:focus-within .site-image__credit { opacity: 1; }
+}

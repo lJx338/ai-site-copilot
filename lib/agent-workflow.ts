@@ -139,13 +139,13 @@ export const executionPrompt = `你是一个真实的网站建站 Agent，运行
 const foundationPrompt = `你是建站 Agent 的「全站基础」阶段。系统已经按计划创建了每个页面的骨架文件（带 ${STUB_MARKER} 标记）并在 App.tsx 注册了路由。页面内容会由后续的页面 Agent 分别完成，你不要修改 src/pages 下的文件。
 
 你的任务（全部完成后再结束回复）：
-1. 按 design.md 改写 src/styles/tokens.css 和 design/tokens.json：颜色、字体、间距、圆角、阴影。保留已有变量名（--color-brand、--color-accent、--layout-max、--space-section 等），可以新增变量。
+1. 按 design.md 改写 src/styles/tokens.css 和 design/tokens.json：颜色、字体、间距、圆角、阴影。**必须保留模板里的全部变量名**（--color-ink、--color-muted、--color-paper、--color-surface、--color-brand、--color-accent、--color-line、--font-display、--font-sans、--layout-max、--layout-gutter、--space-section、--radius-card、--radius-button、--shadow-soft），区块库依赖它们；可以新增变量。建议同时定义 --color-on-brand（品牌色按钮上的文字颜色）和 --color-accent-on-dark（深色背景上的强调色），保证对比度。
 2. 按设计改写 src/styles/globals.css：全站基础排版、Header/Footer 样式、按钮和通用区块样式。页面专属样式由页面 Agent 写在 src/styles/pages/ 下，这里不用写。
 3. 创建 src/content/site.ts：导出全站共用事实（品牌名、英文名、一句话介绍、地址、营业时间、电话、邮箱、社交账号等），内容来自 design.md 的内容事实表。
 4. 更新 src/app/site-manifest.ts 的 brand（不能删除或修改已有 routes 的 path），改写 Header 和 Footer：从 site.ts 取数据，导航和主 CTA 按钮只能指向已注册的路由。
 5. 更新 index.html 的 title 和 description。
 6. 写 docs/content-todo.md：列出所有由你补全的示例事实，方便上线前替换。
-7. 可以在 src/components/ 下新增可复用的展示组件（例如区块标题、数据条、评价卡、图片框），供各页面使用。
+7. src/components/blocks/ 是系统提供的区块库（首屏、功能网格、图文交错、产品卡、评价、流程、FAQ、CTA 等），样式跟随 tokens.css，你不能修改它。只有区块库没有覆盖的展示组件，才在 src/components/ 下新增。
 
 写入要求：
 - 第 1 轮就同时写出 tokens.css、design/tokens.json、src/content/site.ts 和 index.html；第 2 轮同时写出 globals.css、Header、Footer 和共享组件。
@@ -160,12 +160,13 @@ function pagePrompt(page: PlannedPage, routeList: string) {
 
 要求：
 1. 把 ${page.file} 从骨架改写成完整页面（删除 ${STUB_MARKER} 标记），完成页面目的和 design.md 中这个页面的蓝图。页尾要有明确的行动入口。
+   **优先用区块库搭页面**（目录见附带的 skills/blocks/SKILL.md，从 "../components/blocks" 导入）：区块已经处理好版式、间距、手机端、动效和配图，你把精力放在内容和区块的组合节奏上——相邻区块交替 tone（light / muted），每页用一两次 dark，同一种区块不要连续出现。区块表达不了的部分（复杂表格、交互筛选、特殊图表）再自己写。
 2. 页面数据写在 src/content/${page.slug}.ts 并在页面中导入使用；全站事实（品牌名、地址、电话、营业时间）从 src/content/site.ts 导入，不要重复编写，也不要与之矛盾。
 3. 页面专属样式写在 src/styles/pages/${page.slug}.css，并在页面文件里 import "../styles/pages/${page.slug}.css"。使用 tokens.css 的变量；类名统一加 "${page.slug}-" 前缀，避免与其他页面冲突。
 4. 需要拆分组件时，放在 src/components/sections/ 下，文件名以 ${prefix} 开头。不要修改其他任何文件（包括全局样式、Header、Footer 和共享组件）。
 5. 内部链接只能指向这些已注册路由：${routeList}。
 6. 配图：网站要有真实感的图片，不要用 CSS 色块或 SVG 假装照片。首屏放一张主图，产品或服务、使用场景、团队、案例等区块按需配图，每页至少 3 张。统一使用 SiteImage 组件（import SiteImage from "../components/ui/SiteImage"），写法：<SiteImage slot="${page.slug}-hero" kind="photo" query="英文关键词 3 到 6 个词" prompt="中文画面描述" ratio="16:9" alt="中文替代文字" priority />。
-   - slot 全站唯一，用 "${page.slug}-用途" 命名；数据文件里的列表项也可以带 imageQuery、imagePrompt 字段，再传给 SiteImage。
+   - slot 用 "${page.slug}-用途" 命名，全站唯一。**同一个产品在任何页面都用同一个 slot**：统一写成 "product-型号或产品 ID"（例如 "product-ds5080"），不加页面前缀，这样全站只生成一张图、各页面看起来一致。数据文件里的列表项可以带 imageQuery、imagePrompt 字段，再传给 SiteImage。
    - kind：真实场景、环境、氛围用 photo；具体的产品（本网站自己的型号或商品）用 product，会按 prompt 由 AI 生成产品图；人物用 portrait；背景纹理用 texture。
    - query 写给图库搜索，用英文具体描述画面（例如 "engineer testing circuit board oscilloscope lab"）；prompt 写给 AI 生成，用中文描述画面主体、环境和构图。
    - 你只需要声明需要什么图，系统会自动配好图片，不要自己写图片地址。
@@ -918,6 +919,11 @@ function routeListOf(pages: PlannedPage[]) {
   return pages.map((page) => `${page.route}（${page.name}）`).join("、");
 }
 
+// 系统提供的区块库和图片组件：Agent 只能使用，不能修改（全站基础阶段也不行）。
+function isLibraryFile(file: string) {
+  return file.startsWith("src/components/blocks/") || file === "src/components/ui/SiteImage.tsx" || file === "src/styles/blocks.css" || file === "src/styles/site-image.css" || file === "src/content/images.ts";
+}
+
 async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) {
   const { apiKey, projectId, message, plan, root, emit } = context;
   const routes = planned.map((page) => page.route);
@@ -926,7 +932,7 @@ async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) 
   const allowed = ["src/styles/tokens.css", "src/styles/globals.css", "design/tokens.json", "src/app/site-manifest.ts", "src/content/site.ts", "index.html", "docs/content-todo.md"];
   const scope: WriteScope = {
     description: `${allowed.join("、")}、src/layouts/、src/components/（不含 sections/）`,
-    allows: (file) => allowed.includes(file) || file.startsWith("src/layouts/") || (file.startsWith("src/components/") && !file.startsWith("src/components/sections/")),
+    allows: (file) => allowed.includes(file) || file.startsWith("src/layouts/") || (file.startsWith("src/components/") && !file.startsWith("src/components/sections/") && !isLibraryFile(file)),
   };
   const verify = async () => {
     await applyAutoFixes(root, "verify:全站基础");
@@ -962,14 +968,15 @@ async function runPage(context: ExecutionContext, page: PlannedPage, planned: Pl
   const summaries = await listWorkspaceSummaries(root);
   const sharedComponents = summaries.filter((file) => file.path.startsWith("src/components/") && !file.path.startsWith("src/components/sections/")).map((file) => file.path);
   // 完整附上页面需要的共享文件（基线里 site.ts 被截断，Agent 只好一遍遍重新读取）
-  const files = await fileBundle(root, [page.file, "src/content/site.ts", "src/styles/tokens.css", "src/app/router.tsx", ...sharedComponents.filter((file) => !file.endsWith("Header.tsx") && !file.endsWith("Footer.tsx"))], 40000);
+  // 区块库只附目录和类型定义（完整源码很长，需要时可以 read_file）
+  const files = await fileBundle(root, [page.file, "src/content/site.ts", "src/styles/tokens.css", "src/app/router.tsx", "skills/blocks/SKILL.md", "src/components/blocks/types.ts", ...sharedComponents.filter((file) => !file.endsWith("Header.tsx") && !file.endsWith("Footer.tsx") && !file.startsWith("src/components/blocks/"))], 40000);
   const globals = await readOptionalFile(root, "src/styles/globals.css");
   const prefix = page.component.replace(/Page$/, "");
   const owned = (file: string) => file === page.file || file.startsWith(`src/content/${page.slug}`) || file === `src/styles/pages/${page.slug}.css` || file.startsWith(`src/components/sections/${prefix}`);
   const scope: WriteScope = { description: `${page.file}、src/content/${page.slug}*.ts、src/styles/pages/${page.slug}.css、src/components/sections/${prefix}*.tsx`, allows: owned };
   const readScope: ReadScope = {
     reason: "其他页面由别的 Agent 并行实现，不要参考它们；需要的共享文件已经附在消息里。",
-    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/"),
+    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/") || file === "skills/blocks/SKILL.md",
   };
   const verify = async () => {
     await applyAutoFixes(root, `verify:${page.name}`);

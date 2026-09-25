@@ -620,12 +620,14 @@ async function resolveImages(projectId, style) {
   await mkdir(dir, { recursive: true });
   const index = await readAssetIndex(projectId);
   const usedIds = new Set(Object.values(index).map((item) => item.photoId).filter(Boolean).map(String));
-  const aiMax = Number(process.env.IMAGE_AI_MAX || 8);
+  const aiMax = Number(process.env.IMAGE_AI_MAX || 12);
   let aiUsed = 0;
   const port = Number(process.env.AI_PREVIEW_SERVER_PORT || 5174);
   const manifest = {};
   const stats = [];
-  await mapLimit(slots, 4, async (slot) => {
+  // 产品图优先占用 AI 生图额度：先处理 kind=product 的图片位
+  const ordered = [...slots].sort((a, b) => Number(b.kind === "product") - Number(a.kind === "product"));
+  await mapLimit(ordered, 4, async (slot) => {
     const itemStarted = Date.now();
     const descriptor = `${slot.kind}|${slot.query}|${slot.prompt}|${slot.ratio}|${slot.kind === "product" || !slot.query ? style : ""}`;
     const hash = createHash("sha1").update(descriptor).digest("hex").slice(0, 16);
@@ -648,7 +650,9 @@ async function resolveImages(projectId, style) {
           const { output, width, height } = await toWebp(Buffer.from(await download.arrayBuffer()), slot.ratio);
           const file = `${hash}.webp`;
           await writeFile(path.join(dir, file), output);
-          const asset = { width, height, source: "pexels", credit: photo.photographer, creditUrl: photo.url };
+          // 有些摄影师的名字是网址，署名里只保留域名，避免又长又乱
+          const credit = String(photo.photographer || "Pexels").replace(/^https?:\/\/(www\.)?/i, "").replace(/\/+$/, "").slice(0, 32);
+          const asset = { width, height, source: "pexels", credit, creditUrl: photo.url };
           index[hash] = { file, asset, photoId: photo.id, slot: slot.slot, query: slot.query };
           manifest[slot.slot] = { ...asset, src: `http://127.0.0.1:${port}/assets/${path.basename(dir)}/${file}` };
           stats.push({ slot: slot.slot, route: slot.route, source: "pexels", cached: false, ms: Date.now() - itemStarted, bytes: output.length, ...(errors.length ? { fallback: errors.join("；") } : {}) });
