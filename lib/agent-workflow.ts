@@ -460,7 +460,7 @@ function normalizeReview(value: unknown): SiteReview {
 export type VisualDimension = "hierarchy" | "rhythm" | "imagery" | "typography" | "consistency" | "mobile";
 export type VisualIssue = { severity: "must" | "should"; viewport: "desktop" | "mobile"; tile: number; section: string; problem: string; fix: string };
 export type PageVisualReview = { route: string; overall: number; scores: Record<VisualDimension, number>; strengths: string[]; issues: VisualIssue[]; lint: { must: number; should: number }; error?: string };
-export type VisualReview = { overall: number; scores: Record<VisualDimension, number>; pages: PageVisualReview[]; lintMust: number; lintShould: number; skipped?: string };
+export type VisualReview = { overall: number; scores: Record<VisualDimension, number>; pages: PageVisualReview[]; lintMust: number; lintShould: number; skipped?: string; screens?: PageScreens[] };
 
 const visualDimensions: VisualDimension[] = ["hierarchy", "rhythm", "imagery", "typography", "consistency", "mobile"];
 
@@ -549,6 +549,7 @@ export async function visualReview(apiKey: string, projectId: string, maxTiles =
     pages,
     lintMust: pages.reduce((total, page) => total + page.lint.must, 0),
     lintShould: pages.reduce((total, page) => total + page.lint.should, 0),
+    screens: screens.pages,
   };
 }
 
@@ -742,6 +743,8 @@ type AgentOptions = {
   maxVerifyRounds?: number;
   // 轮数快用完时，提醒 Agent 必须先写出的文件（例如页面文件本身）
   mustWrite?: string;
+  // 附带给 Agent 看的截图（base64 JPEG），deepseek-flash 支持图片输入
+  images?: string[];
 };
 
 type AgentOutcome = { reply: string; events: string[]; toolCallCount: number; remainingIssues: string[] };
@@ -768,7 +771,11 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   const budget = canWrite
     ? `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话。每一轮都可以同时调用多个工具（例如一次读取多个文件、一次写入多个文件），请合并调用。需要的文件大多已经附在消息里，不要为了“参考写法”去读其他文件。最迟第 2 轮开始写文件${options.mustWrite ? `，并且最先写出 ${options.mustWrite}` : ""}。思考用来规划页面结构和关键设计决策，想得充分再动手；代码直接写进 write_file 即可，不必在思考里先完整写一遍。`
     : `\n\n# 轮次预算\n你最多有 ${options.maxTurns} 轮对话，每一轮都可以同时调用多个工具。`;
-  const messages: ChatMessage[] = [{ role: "system", content: `${options.system}${budget}` }, { role: "user", content: options.user }];
+  const userContent = options.images?.length
+    ? [{ type: "text", text: options.user }, ...options.images.map((image) => ({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}`, detail: "high" } }))]
+    : options.user;
+  // 图片只能放在 user 消息里，内容是内容块数组
+  const messages = [{ role: "system", content: `${options.system}${budget}` }, { role: "user", content: userContent }] as unknown as ChatMessage[];
   const events: string[] = [];
   let reply = "";
   let toolCallCount = 0;
@@ -961,6 +968,18 @@ async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) 
   });
 }
 
+// 页面 Agent 的读写范围：页面文件、自己的数据 / 样式 / 区块组件；可读共享组件和样式。
+function pageAccess(page: PlannedPage): { owned: (file: string) => boolean; scope: WriteScope; readScope: ReadScope } {
+  const prefix = page.component.replace(/Page$/, "");
+  const owned = (file: string) => file === page.file || file.startsWith(`src/content/${page.slug}`) || file === `src/styles/pages/${page.slug}.css` || file.startsWith(`src/components/sections/${prefix}`);
+  const scope: WriteScope = { description: `${page.file}、src/content/${page.slug}*.ts、src/styles/pages/${page.slug}.css、src/components/sections/${prefix}*.tsx`, allows: owned };
+  const readScope: ReadScope = {
+    reason: "其他页面由别的 Agent 负责，不要参考它们；需要的共享文件已经附在消息里。",
+    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/") || file === "skills/blocks/SKILL.md",
+  };
+  return { owned, scope, readScope };
+}
+
 async function runPage(context: ExecutionContext, page: PlannedPage, planned: PlannedPage[]) {
   const { apiKey, projectId, message, plan, root, emit } = context;
   const design = await readOptionalFile(root, "docs/design.md");
@@ -971,13 +990,7 @@ async function runPage(context: ExecutionContext, page: PlannedPage, planned: Pl
   // 区块库只附目录和类型定义（完整源码很长，需要时可以 read_file）
   const files = await fileBundle(root, [page.file, "src/content/site.ts", "src/styles/tokens.css", "src/app/router.tsx", "skills/blocks/SKILL.md", "src/components/blocks/types.ts", ...sharedComponents.filter((file) => !file.endsWith("Header.tsx") && !file.endsWith("Footer.tsx") && !file.startsWith("src/components/blocks/"))], 40000);
   const globals = await readOptionalFile(root, "src/styles/globals.css");
-  const prefix = page.component.replace(/Page$/, "");
-  const owned = (file: string) => file === page.file || file.startsWith(`src/content/${page.slug}`) || file === `src/styles/pages/${page.slug}.css` || file.startsWith(`src/components/sections/${prefix}`);
-  const scope: WriteScope = { description: `${page.file}、src/content/${page.slug}*.ts、src/styles/pages/${page.slug}.css、src/components/sections/${prefix}*.tsx`, allows: owned };
-  const readScope: ReadScope = {
-    reason: "其他页面由别的 Agent 并行实现，不要参考它们；需要的共享文件已经附在消息里。",
-    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/") || file === "skills/blocks/SKILL.md",
-  };
+  const { owned, scope, readScope } = pageAccess(page);
   const verify = async () => {
     await applyAutoFixes(root, `verify:${page.name}`);
     const issues = pageIssues(await listWorkspaceFiles(root), page.file);
@@ -1108,6 +1121,115 @@ async function executeRepair(context: ExecutionContext, repairMessage: string) {
     verify: () => projectVerify(projectId, root),
   });
   return { reply: outcome.reply, events: [...events, ...outcome.events], toolCallCount: toolCallCount + outcome.toolCallCount };
+}
+
+// ---- 视觉修复：按看图审查和浏览器检查的问题做一轮定向修改 ----
+const GLOBAL_SECTION = /header|footer|site-header|site-footer|导航|页头|页脚|顶栏|全站|nav\b/i;
+
+// 默认只修“必须修”的客观问题（溢出、裁切、坏图、看不清的文字）：效果确定，不会越改越差。
+// AI_VISUAL_FIX=all 时连审美建议一起修（实测整站约 +2.5 分，接近评分波动，但费用和耗时明显增加）。
+export function fixableVisualIssues(visual: VisualReview, mode: "must" | "all" = process.env.AI_VISUAL_FIX === "all" ? "all" : "must") {
+  const pages = new Map<string, { issues: VisualIssue[]; lint: string[]; tiles: Array<{ viewport: "desktop" | "mobile"; tile: number }> }>();
+  const global: string[] = [];
+  for (const review of visual.pages) {
+    const entry = { issues: [] as VisualIssue[], lint: [] as string[], tiles: [] as Array<{ viewport: "desktop" | "mobile"; tile: number }> };
+    for (const issue of review.issues) {
+      if (mode === "must" && issue.severity !== "must") continue;
+      if (GLOBAL_SECTION.test(issue.section)) global.push(`[${review.route} ${issue.viewport}] ${issue.problem} → ${issue.fix}`);
+      else { entry.issues.push(issue); entry.tiles.push({ viewport: issue.viewport, tile: issue.tile }); }
+    }
+    for (const screens of (visual.screens ?? []).filter((item) => item.route === review.route)) {
+      for (const item of screens.lint.must) {
+        const own = item.samples.filter((sample) => !GLOBAL_SECTION.test(sample));
+        const shared = item.samples.filter((sample) => GLOBAL_SECTION.test(sample));
+        if (own.length) entry.lint.push(`[必须修 · ${screens.viewport}] ${item.msg}：${own.join("；")}`);
+        if (shared.length) global.push(`[${review.route} ${screens.viewport}] ${item.msg}：${shared.join("；")}`);
+      }
+      if (mode === "all") for (const item of screens.lint.should.filter((lint) => lint.count >= 3).slice(0, 3)) entry.lint.push(`[建议 · ${screens.viewport}] ${item.msg} ×${item.count}，例如：${item.samples.slice(0, 2).join("；")}`);
+    }
+    if (entry.issues.length || entry.lint.length) pages.set(review.route, entry);
+  }
+  return { pages, global: [...new Set(global)].slice(0, 12) };
+}
+
+function tilesFor(visual: VisualReview, route: string, wanted: Array<{ viewport: "desktop" | "mobile"; tile: number }>, limit = 4) {
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  const targets = wanted.length ? wanted : [{ viewport: "desktop" as const, tile: 1 }, { viewport: "mobile" as const, tile: 1 }];
+  for (const target of targets) {
+    const key = `${target.viewport}-${target.tile}`;
+    if (seen.has(key) || picked.length >= limit) continue;
+    seen.add(key);
+    const tile = visual.screens?.find((item) => item.route === route && item.viewport === target.viewport)?.tiles[target.tile - 1];
+    if (tile) picked.push(tile);
+  }
+  return picked;
+}
+
+const visualFixPrompt = `你是网站的视觉修复 Agent。视觉审查员看过渲染后的截图（附在消息里），列出了下面的问题。请逐条修复“必须修”的问题，并尽量改进“建议”类问题。
+
+规则：
+- 只做视觉和版式上的修改：间距、对齐、字号、对比度、换行、裁切、区块组合与节奏、图片比例。不要删减内容，不要改写文案含义。
+- 区块库（src/components/blocks）不能修改，只能通过 props、变体、tone 和组合方式调整；页面自己的样式写在页面的样式文件里。
+- 修改前先读需要改的文件（已附在消息里的不用再读），用 apply_patch 做小改动，改动较大时用 write_file。
+- 改完用一两句话说明修了哪些问题。`;
+
+export async function executeVisualFixes({ apiKey, projectId, message, root, emit, visual }: { apiKey: string; projectId: string; message: string; root: string; emit: WorkflowEmitter; visual: VisualReview }) {
+  const { pages, global } = fixableVisualIssues(visual);
+  const files = await listWorkspaceFiles(root);
+  const manifest = files.find((file) => file.path === "src/app/site-manifest.ts")?.content ?? "";
+  const planned = planPages(manifestRoutes(files).map((route) => ({ route, name: manifest.match(new RegExp(`path:\\s*["'\`]${route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["'\`]\\s*,\\s*label:\\s*["'\`]([^"'\`]+)`))?.[1] ?? route, goal: "" })));
+  const tasks: Array<() => Promise<AgentOutcome>> = [];
+  for (const page of planned) {
+    const entry = pages.get(page.route);
+    if (!entry) continue;
+    const { owned, scope, readScope } = pageAccess(page);
+    const ownedFiles = files.filter((file) => owned(file.path)).map((file) => file.path);
+    const issueText = [...entry.issues.map((issue) => `- [${issue.severity === "must" ? "必须修" : "建议"} · ${issue.viewport} 第 ${issue.tile} 张截图 · ${issue.section}] ${issue.problem} → ${issue.fix}`), ...entry.lint.map((line) => `- ${line}`)].join("\n");
+    tasks.push(async () => runAgent({
+      apiKey, root, emit, scope, readScope,
+      tag: `视觉修复·${page.name}`,
+      tools: focusedTools,
+      maxTurns: 6,
+      images: tilesFor(visual, page.route, entry.tiles),
+      system: `${visualFixPrompt}\n\n你负责页面：${page.name}（${page.route}）。只能修改：${scope.description}。`,
+      user: `项目 ID：${projectId}\n用户需求：\n${message}\n\n# 视觉问题\n${issueText}\n\n# 本页文件\n${await fileBundle(root, ownedFiles, 40000)}\n\n# 区块库目录\n${await fileBundle(root, ["skills/blocks/SKILL.md"], 12000)}`,
+      verify: async () => {
+        const issues = pageIssues(await listWorkspaceFiles(root), page.file);
+        issues.push(...await typeErrors(projectId, root, (line) => owned(line.split("(")[0])));
+        return issues;
+      },
+    }));
+  }
+  if (global.length) {
+    const allowed = ["src/styles/tokens.css", "src/styles/globals.css", "design/tokens.json", "src/content/site.ts", "index.html"];
+    const scope: WriteScope = { description: `${allowed.join("、")}、src/layouts/、src/components/site/`, allows: (file) => allowed.includes(file) || file.startsWith("src/layouts/") || file.startsWith("src/components/site/") };
+    tasks.push(async () => runAgent({
+      apiKey, root, emit, scope,
+      tag: "视觉修复·全站",
+      tools: focusedTools,
+      maxTurns: 6,
+      images: tilesFor(visual, "/", [{ viewport: "desktop", tile: 1 }, { viewport: "mobile", tile: 1 }]),
+      system: `${visualFixPrompt}\n\n你负责全站共用的部分：导航、页脚、设计令牌和全局样式。只能修改：${scope.description}。改颜色时保留令牌变量名。`,
+      user: `项目 ID：${projectId}\n\n# 视觉问题\n${global.map((line) => `- ${line}`).join("\n")}\n\n# 当前文件\n${await fileBundle(root, ["src/styles/tokens.css", "src/components/site/Header.tsx", "src/components/site/Footer.tsx", "src/styles/globals.css"], 30000)}`,
+      // 只检查自己能改的文件，不被页面文件里的问题卡住
+      verify: async () => {
+        await applyAutoFixes(root, "verify:视觉修复·全站");
+        const issues = analyzeProject(await listWorkspaceFiles(root)).filter((issue) => issue.severity === "error" && scope.allows(issue.file)).map((issue) => issue.message);
+        issues.push(...await typeErrors(projectId, root, (line) => scope.allows(line.split("(")[0])));
+        return issues;
+      },
+    }));
+  }
+  if (!tasks.length) return { reply: "", events: [] as string[], toolCallCount: 0, agents: 0 };
+  await emit({ type: "stage", stage: "visual_fix", label: `正在按视觉审查修复：${pages.size} 个页面${global.length ? " + 全站样式" : ""}` });
+  const outcomes = await mapLimit(tasks, PAGE_CONCURRENCY, async (task) => { try { return await task(); } catch (error) { return { reply: "", events: [], toolCallCount: 0, remainingIssues: [error instanceof Error ? error.message : String(error)] } as AgentOutcome; } });
+  return {
+    reply: outcomes.map((outcome) => outcome.reply.split("\n")[0]).filter(Boolean).join("\n"),
+    events: outcomes.flatMap((outcome) => outcome.events),
+    toolCallCount: outcomes.reduce((total, outcome) => total + outcome.toolCallCount, 0),
+    agents: outcomes.length,
+  };
 }
 
 async function executeAudit(context: ExecutionContext) {

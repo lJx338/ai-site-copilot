@@ -134,6 +134,9 @@ export class RunTelemetry {
       pages: Array<{ route: string; overall: number; issues: Array<{ severity: string; viewport: string; section: string; problem: string; fix: string }>; error?: string }>;
       skipped?: string;
     };
+    // 视觉修复前的分数，以及修复是否被保留
+    visualBefore?: { overall: number; scores: Record<string, number>; lintMust: number };
+    visualFix?: { applied: boolean; agents: number; reverted?: string };
   };
   private seq = 0;
   private currentStage?: { stage: string; startedMs: number };
@@ -312,6 +315,7 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
       `质量：${summary.quality.passed ? "验收通过" : "验收未通过"} · 页面 ${summary.quality.pages.filter((page) => !page.stub).length}/${summary.quality.pages.length} 已实现 · 审查 ${summary.quality.reviewScore ?? "-"} 分`,
       ...summary.quality.pages.map((page) => `  ${page.route.padEnd(18)} ${page.stub ? "骨架" : "完成"} · 代码 ${(page.codeBytes / 1000).toFixed(1)}k · 样式 ${(page.cssBytes / 1000).toFixed(1)}k · 渲染字数 ${page.renderedChars ?? "-"}`),
     ] : []),
+    ...(summary.quality?.visualBefore ? [`视觉修复：${summary.quality.visualBefore.overall} → ${summary.quality.visual?.overall ?? "-"} 分${summary.quality.visualFix?.reverted ? `（已恢复修复前版本：${summary.quality.visualFix.reverted}）` : ""}`] : []),
     ...(summary.quality?.visual && !summary.quality.visual.skipped ? [`视觉：${summary.quality.visual.overall} 分 · ${Object.entries(summary.quality.visual.scores).map(([key, value]) => `${key} ${value}`).join(" ")} · 浏览器检查必须修 ${summary.quality.visual.lintMust} 处`] : []),
     ...(summary.images.slots ? [`图片：${summary.images.slots} 个图片位 · 图库 ${summary.images.pexels} · AI ${summary.images.ai} · 未解析 ${summary.images.failed} · 新解析 ${summary.images.newlyResolved} 张`] : []),
     ...(summary.autofixes.length ? [`代码自动修复：${summary.autofixes.map((item) => `${item.stage}(${item.fixes.length})`).join("、")}`] : []),

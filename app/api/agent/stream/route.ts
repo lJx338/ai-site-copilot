@@ -1,5 +1,6 @@
-import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
-import { applyAutoFixes, applySiteImages, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
+import { writeFile } from "node:fs/promises";
+import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles, removeFilesNotIn, safeWorkspacePath } from "../../../../lib/project-workspace";
+import { applyAutoFixes, applySiteImages, classifyIntent, executeVisualFixes, fixableVisualIssues, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
 import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
 
@@ -67,7 +68,7 @@ export async function POST(request: Request) {
       const run = new RunTelemetry(projectId, message);
       // 统一收尾：记录结果、打印汇总表、保存报告。返回一行给用户看的消耗摘要。
       let lastInspection: InspectResult | undefined;
-      const finalizeRun = async (outcome: string, error?: string, review?: SiteReview, visual?: VisualReview) => {
+      const finalizeRun = async (outcome: string, error?: string, review?: SiteReview, visual?: VisualReview, visualBefore?: VisualReview, visualFix?: { applied: boolean; agents: number; reverted?: string }) => {
         const files = await listWorkspaceFiles(root).catch(() => []);
         run.finalFiles = files.filter((file) => file.path.startsWith("src/")).map((file) => ({ path: file.path, bytes: file.content.length }));
         if (run.intent !== "ask") {
@@ -78,6 +79,8 @@ export async function POST(request: Request) {
             reviewScore: review?.score,
             reviewOk: review?.ok,
             reviewIssues: review?.blockingIssues,
+            visualBefore: visualBefore ? { overall: visualBefore.overall, scores: visualBefore.scores, lintMust: visualBefore.lintMust } : undefined,
+            visualFix,
             visual: visual ? { overall: visual.overall, scores: visual.scores, lintMust: visual.lintMust, lintShould: visual.lintShould, skipped: visual.skipped, pages: visual.pages.map((page) => ({ route: page.route, overall: page.overall, error: page.error, issues: page.issues })) } : undefined,
           };
         }
@@ -132,15 +135,18 @@ export async function POST(request: Request) {
           let validation: ValidationResult = { ok: false, skipped: true };
           let structuralCheck: { ok: boolean; errors?: string[]; warnings?: string[] } = { ok: true };
           let qualityReview: SiteReview | undefined;
-          for (let repairRound = 0; repairRound <= MAX_REPAIR_ROUNDS; repairRound += 1) {
+          // 校验与修复循环：自动修复 → 配图 → 构建 → 完整性检查 → 浏览器检查 →（首轮新建时）内容审查，
+          // 有问题就交给修复阶段。视觉修复之后会用更少的轮数再跑一次。
+          const runChecks = async (maxRounds: number, phase: string) => {
+          for (let repairRound = 0; repairRound <= maxRounds; repairRound += 1) {
             // 每一层检查的问题都收集起来一起交给修复 Agent，避免后面的检查覆盖前面的错误。
             const problems: string[] = [];
             let previewUnavailable = false;
-            enterStage(`check_${repairRound}`);
-            const fixes = await applyAutoFixes(root, `check_${repairRound}`);
+            enterStage(`${phase}check_${repairRound}`);
+            const fixes = await applyAutoFixes(root, `${phase}check_${repairRound}`);
             if (fixes.length) await emit({ type: "autofix", label: `代码自动修复了 ${fixes.length} 个问题`, error: fixes.slice(0, 3).join("；") });
             // 配图需要能构建的页面；构建失败时跳过，修复后的下一轮会再解析
-            await applySiteImages(projectId, root, emit, `check_${repairRound}`).catch(() => undefined);
+            await applySiteImages(projectId, root, emit, `${phase}check_${repairRound}`).catch(() => undefined);
             let checkStarted = Date.now();
             try {
               await syncWorkspaceToPreview(projectId, root);
@@ -171,7 +177,7 @@ export async function POST(request: Request) {
               problems.push(...inspection.issues);
             }
             // 内容审查是主观判断，只在新建网站时做一次，避免小改动被反复“再优化”。
-            if (intent.intent === "new_site" && !qualityReview && !problems.length && (validation.ok || previewUnavailable)) {
+            if (intent.intent === "new_site" && !phase && !qualityReview && !problems.length && (validation.ok || previewUnavailable)) {
               await emit({ type: "quality_review_started", label: "正在按设计 Skill 审查内容完整度和页面差异" });
               enterStage("review");
               checkStarted = Date.now();
@@ -181,35 +187,68 @@ export async function POST(request: Request) {
               if (!qualityReview.ok) problems.push(...qualityReview.blockingIssues.map((issue) => `内容审查：${issue}`));
             }
             if (problems.length) validation = { ...validation, ok: false, error: problems.slice(0, 6).join("；") };
-            if (!problems.length || repairRound === MAX_REPAIR_ROUNDS) break;
+            if (!problems.length || repairRound === maxRounds) break;
             const repairReason = problems.slice(0, 30).map((problem) => `- ${problem}`).join("\n");
             run.repairs.push({ round: repairRound + 1, problems });
-            enterStage(`repair_${repairRound + 1}`);
-            await emit({ type: "repair_started", round: repairRound + 1, label: `校验发现 ${problems.length} 个问题，正在自动修复（${repairRound + 1}/${MAX_REPAIR_ROUNDS}）`, error: problems.slice(0, 3).join("；") });
+            enterStage(`${phase}repair_${repairRound + 1}`);
+            await emit({ type: "repair_started", round: repairRound + 1, label: `校验发现 ${problems.length} 个问题，正在自动修复（${repairRound + 1}/${maxRounds}）`, error: problems.slice(0, 3).join("；") });
             execution = await executePlan({ apiKey, projectId, message, plan, root, emit, repairMessage: repairReason, history });
           }
-
-          const files = await listWorkspaceFiles(root);
-          const check = structuralCheck.ok ? (execution?.lastCheck || await checkWorkspace(root)) : structuralCheck;
+          return validation.ok;
+          };
+          await runChecks(MAX_REPAIR_ROUNDS, "");
           // 评估用：新建网站结束时总要有一个审查分数。校验失败时循环里不会跑审查，
           // 这里补一次，只记录分数，不再触发修复。
           if (intent.intent === "new_site" && !qualityReview) {
             enterStage("final_review");
             qualityReview = await reviewSite(apiKey, projectId, message, root);
           }
-          // 视觉审查（阶段 1 只记录分数，用来衡量视觉优化的效果；阶段 4 再接入修复）
+          // 视觉审查 + 一轮视觉修复。修复后必须重新通过校验，并且分数不能明显下降，
+          // 否则恢复修复前的版本：视觉修复只会让网站更好，不会把能用的网站改坏。
           let visual: VisualReview | undefined;
+          let visualBefore: VisualReview | undefined;
+          let visualFix: { applied: boolean; agents: number; reverted?: string } | undefined;
           if (intent.intent === "new_site" && validation.ok) {
             enterStage("visual_review");
             await emit({ type: "stage", stage: "visual_review", label: "正在截图并看图审查视觉效果" });
             visual = await visualReview(apiKey, projectId);
             await emit({ type: "visual_review_done", ok: !visual.skipped, label: visual.skipped ? `视觉审查已跳过：${visual.skipped}` : `视觉审查 ${visual.overall} 分（图片 ${visual.scores.imagery}、节奏 ${visual.scores.rhythm}、手机 ${visual.scores.mobile}）` });
+            const fixable = visual.skipped ? { pages: new Map(), global: [] as string[] } : fixableVisualIssues(visual);
+            if (process.env.AI_VISUAL_FIX !== "off" && (fixable.pages.size || fixable.global.length)) {
+              const before = visual;
+              const snapshot = await listWorkspaceFiles(root);
+              enterStage("visual_fix");
+              const fix = await executeVisualFixes({ apiKey, projectId, message, root, emit, visual: before });
+              visualFix = { applied: true, agents: fix.agents };
+              const restore = async (reason: string) => {
+                await removeFilesNotIn(root, new Set(snapshot.map((file) => file.path)));
+                for (const file of snapshot) await writeFile(safeWorkspacePath(root, file.path), file.content, "utf8");
+                visualFix = { applied: false, agents: fix.agents, reverted: reason };
+                await emit({ type: "visual_fix_reverted", ok: false, label: `视觉修复没有保留（${reason}），已恢复修复前的版本` });
+                await runChecks(0, "restore_");
+              };
+              if (!await runChecks(2, "visual_")) await restore("修复后没有通过校验");
+              else {
+                enterStage("visual_review_after");
+                await emit({ type: "stage", stage: "visual_review", label: "视觉修复完成，重新截图审查" });
+                const after = await visualReview(apiKey, projectId);
+                if (!after.skipped && after.overall < before.overall - 5) await restore(`视觉分数从 ${before.overall} 降到 ${after.overall}`);
+                else if (!after.skipped) {
+                  visualBefore = before;
+                  visual = after;
+                  await emit({ type: "visual_review_done", ok: true, label: `视觉修复后 ${after.overall} 分（修复前 ${before.overall} 分）` });
+                }
+              }
+            }
           }
-          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error, qualityReview, visual);
+          const files = await listWorkspaceFiles(root);
+          const check = structuralCheck.ok ? (execution?.lastCheck || await checkWorkspace(root)) : structuralCheck;
+          const usage = await finalizeRun(validation.ok ? "ok" : "validation_failed", validation.ok ? undefined : validation.error, qualityReview, visual, visualBefore, visualFix);
           const baseReply = execution?.reply || (validation.ok
             ? "构建、完整性检查和浏览器检查都通过了，没有发现需要修复的问题。如果你在页面上看到了具体问题，直接描述它（例如“手机上导航错位”），我会按修改来处理。"
             : "自动修复没有完全解决问题，剩余问题见下方。");
-          const reply = `${baseReply}\n\n${usage.line}`;
+          const visualLine = visual && !visual.skipped ? `\n视觉审查 ${visual.overall} 分${visualBefore ? `（视觉修复前 ${visualBefore.overall} 分）` : ""}${visualFix?.reverted ? `；视觉修复没有保留：${visualFix.reverted}` : ""}` : "";
+          const reply = `${baseReply}${visualLine}\n\n${usage.line}`;
           await emit({
             type: "completed",
             result: {

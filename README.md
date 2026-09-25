@@ -38,6 +38,8 @@ Agent 执行约束：每个写代码的 Agent 一开始就知道自己的轮数�
 
 区块库：模板里的 `src/components/blocks/` 提供 13 个做好版式、手机端、动效和配图的页面积木（Hero 三种变体、LogoCloud、StatsBand、FeatureGrid、SplitFeature、ProductGrid、Gallery、Testimonials、Steps、Pricing、Faq、CtaBand、ContactBlock），样式在 `src/styles/blocks.css`，只依赖 tokens.css 的变量名。目录和用法在 `skills/blocks/SKILL.md`，页面 Agent 预先拿到目录，优先组合区块、不合适时自己写；区块库、SiteImage 和图片清单对所有 Agent 只读。全站基础阶段必须保留模板里的全部令牌名。用全部区块拼成的样例页在默认主题下视觉审查约 80 分，生成网站目前约 66 分。
 
+视觉修复：新建网站通过校验后做一次看图审查，把问题按归属分给对应页面的 Agent 和“全站样式” Agent，并把相关截图一起发给它们（deepseek-flash 支持图片加工具调用）。只修一轮；修复后必须重新通过校验，且视觉分数下降不超过 5 分，否则自动恢复修复前的版本。`AI_VISUAL_FIX` 默认 `must`（只修溢出、裁切、坏图、看不清的文字这类客观问题），`all` 连审美建议一起修（实测整站约 +2.5 分，接近评分波动，费用约 ¥3.4 高峰价、耗时约 7 分钟），`off` 关闭。
+
 内容策略：用户没提供的事实由 Agent 补全成可信、具体、全站一致的示例内容，并列在 `docs/content-todo.md` 里方便替换；页面上不允许出现占位写法。
 
 浏览器检查会依次查找 `CHROME_PATH`、Playwright 缓存里的 headless shell（最快）和系统安装的 Chrome/Chromium/Edge；都找不到时跳过，不阻塞建站。`DEEPSEEK_MAX_TOKENS` 是单次请求的输出上限（含思考，默认 128000，模型最多 384000），只用来防止失控，不用来压缩产出。**所有配置都要写在 `.env.local` 里**：API 运行在 Cloudflare Workers 运行时中，看不到在命令行里 `export` 或前缀传入的环境变量。
