@@ -20,7 +20,7 @@ import {
 } from "./project-workspace";
 import { classifyWithJev } from "./intent-jev";
 import { currentRun, currentScope, deepseekCost, enterStage, withScope, type AgentRecord } from "./telemetry";
-import { fetchScreens, syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type PageScreens, type ValidationResult } from "./preview-client";
+import { fetchScreens, resolveImages, syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type PageScreens, type ValidationResult } from "./preview-client";
 import { templateFiles } from "./project-template";
 
 export type ChatMessage = {
@@ -116,6 +116,8 @@ export const designPrompt = `你是 AI 建站设计总监。根据 PRD，使用 
 直接输出 Markdown 正文，不要输出 JSON，不要用代码块包裹，控制在 7000 字以内。必须按顺序包含这些二级标题：
 ## 品牌与视觉方向
 情绪关键词、色彩（给出具体 HEX）、字体栈、圆角与阴影、动效原则。
+必须单独写一行「图像风格：……」，用一句话给出全站照片和生成图的统一风格（光线、色调、构图、质感、氛围，例如「自然侧光，冷灰蓝色调，干净留白，浅景深，真实商业摄影质感」），所有页面的配图都会使用这句风格描述。
+每个页面蓝图里要写出配图计划：首屏主图、产品或服务图、场景图、人物图各放在哪里、画面内容是什么。
 ## 内容事实表
 把用户没有提供的事实补全成具体可信的内容：品牌名、地址、营业时间、电话、价格区间、核心产品或服务清单（名称 + 一句描述 + 价格）、团队人物、至少 3 条客户评价等。所有页面都必须使用这里的事实，保证全站一致。禁止任何占位写法。
 ## 全站组件
@@ -162,8 +164,13 @@ function pagePrompt(page: PlannedPage, routeList: string) {
 3. 页面专属样式写在 src/styles/pages/${page.slug}.css，并在页面文件里 import "../styles/pages/${page.slug}.css"。使用 tokens.css 的变量；类名统一加 "${page.slug}-" 前缀，避免与其他页面冲突。
 4. 需要拆分组件时，放在 src/components/sections/ 下，文件名以 ${prefix} 开头。不要修改其他任何文件（包括全局样式、Header、Footer 和共享组件）。
 5. 内部链接只能指向这些已注册路由：${routeList}。
-6. 写入顺序：最先写出 ${page.file}；src/content/${page.slug}.ts 和 src/styles/pages/${page.slug}.css 可以在同一轮或紧接着的下一轮写出。区块直接写在页面文件里即可，拆分组件不是必须的；绝不能只写数据或组件而把页面留成骨架。写完后系统会自动检查，有问题会告诉你。
-7. 结束时用两三句话说明页面结构和设计取舍。`;
+6. 配图：网站要有真实感的图片，不要用 CSS 色块或 SVG 假装照片。首屏放一张主图，产品或服务、使用场景、团队、案例等区块按需配图，每页至少 3 张。统一使用 SiteImage 组件（import SiteImage from "../components/ui/SiteImage"），写法：<SiteImage slot="${page.slug}-hero" kind="photo" query="英文关键词 3 到 6 个词" prompt="中文画面描述" ratio="16:9" alt="中文替代文字" priority />。
+   - slot 全站唯一，用 "${page.slug}-用途" 命名；数据文件里的列表项也可以带 imageQuery、imagePrompt 字段，再传给 SiteImage。
+   - kind：真实场景、环境、氛围用 photo；具体的产品（本网站自己的型号或商品）用 product，会按 prompt 由 AI 生成产品图；人物用 portrait；背景纹理用 texture。
+   - query 写给图库搜索，用英文具体描述画面（例如 "engineer testing circuit board oscilloscope lab"）；prompt 写给 AI 生成，用中文描述画面主体、环境和构图。
+   - 你只需要声明需要什么图，系统会自动配好图片，不要自己写图片地址。
+7. 写入顺序：最先写出 ${page.file}；src/content/${page.slug}.ts 和 src/styles/pages/${page.slug}.css 可以在同一轮或紧接着的下一轮写出。区块直接写在页面文件里即可，拆分组件不是必须的；绝不能只写数据或组件而把页面留成骨架。写完后系统会自动检查，有问题会告诉你。
+8. 结束时用两三句话说明页面结构和设计取舍。`;
 }
 
 export function parseArgs(raw: string) {
@@ -845,6 +852,38 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
     record.remainingIssues = remainingIssues;
     if (run) { run.agents.push(record); run.transcripts[agentName] = messages; }
   }
+}
+
+// 图片解析：页面里用了 <SiteImage> 才运行。收集图片位 → 图库搜索或 AI 生成 → 写入 src/content/images.ts。
+// 设计文档里的"图像风格"会拼进 AI 生图的提示词，让全站的生成图风格一致。
+export async function applySiteImages(projectId: string, root: string, emit: WorkflowEmitter, stage: string) {
+  const files = await listWorkspaceFiles(root);
+  if (!files.some((file) => file.path.startsWith("src/") && file.path !== "src/components/ui/SiteImage.tsx" && /<SiteImage\b/.test(file.content))) return { changed: false };
+  const design = files.find((file) => file.path === "docs/design.md")?.content ?? "";
+  const style = design.match(/图像风格[：:]\s*(.+)/)?.[1]?.trim().slice(0, 300) ?? "";
+  await syncWorkspaceToPreview(projectId, root);
+  await emit({ type: "stage", stage: "images", label: "正在为页面配图：图库搜索，找不到的用 AI 生成" });
+  const result = await resolveImages(projectId, style);
+  if (result.skipped || !result.manifest) {
+    await emit({ type: "images_done", ok: false, label: `配图跳过：${result.reason || "未知原因"}` });
+    return { changed: false };
+  }
+  const run = currentRun();
+  for (const item of result.stats ?? []) run?.images.push({ stage, ...item });
+  const entries = Object.entries(result.manifest).sort(([a], [b]) => a.localeCompare(b));
+  const content = `// 由系统的图片解析步骤自动生成，不要手动编辑。键是 <SiteImage slot="..."> 的 slot。\nexport type SiteImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai"; credit?: string; creditUrl?: string };\n\nexport const images: Record<string, SiteImageAsset> = ${JSON.stringify(Object.fromEntries(entries), null, 2)};\n`;
+  const current = files.find((file) => file.path === "src/content/images.ts")?.content ?? "";
+  const changed = current !== content;
+  if (changed) await writeFile(safeWorkspacePath(root, "src/content/images.ts"), content, "utf8");
+  const stats = result.stats ?? [];
+  const failed = stats.filter((item) => item.source === "none");
+  await emit({
+    type: "images_done",
+    ok: failed.length === 0,
+    label: `配图完成：${result.slots ?? 0} 个图片位 · 图库 ${stats.filter((item) => item.source === "pexels" && !item.cached).length} 张 · AI ${stats.filter((item) => item.source === "ai" && !item.cached).length} 张 · 沿用 ${stats.filter((item) => item.cached).length} 张${failed.length ? ` · ${failed.length} 个未解析` : ""}`,
+    error: [...failed.map((item) => `${item.slot}：${item.error}`), ...stats.filter((item) => item.fallback && !item.cached).slice(0, 1).map((item) => `改用备选来源：${item.fallback}`), ...(result.duplicates?.length ? [`重复的图片位 ID：${result.duplicates.join("、")}`] : [])].slice(0, 3).join("；"),
+  });
+  return { changed };
 }
 
 // 代码自动修复，并把修了什么记进运行报告。

@@ -99,3 +99,18 @@ export async function fetchScreens(projectId: string, maxTiles = 6): Promise<{ s
     return { skipped: true, reason: error instanceof Error ? error.message : "视觉检查不可用", pages: [] };
   }
 }
+
+export type ImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai"; credit?: string; creditUrl?: string };
+export type ImageStat = { slot: string; route?: string; source: "pexels" | "ai" | "none"; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string };
+export type ImageResolveResult = { skipped?: boolean; reason?: string; slots?: number; duplicates?: string[]; manifest?: Record<string, ImageAsset>; stats?: ImageStat[]; ms?: number };
+
+// 让预览服务收集页面上的 <SiteImage> 图片位，从图库搜索或用 AI 生成。调用前需要先同步工作区。
+export async function resolveImages(projectId: string, style: string): Promise<ImageResolveResult> {
+  try {
+    const response = await fetch(`${previewServerUrl()}/images/resolve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId, style }) });
+    if (!response.ok) return { skipped: true, reason: `HTTP ${response.status}` };
+    return await response.json() as ImageResolveResult;
+  } catch (error) {
+    return { skipped: true, reason: error instanceof Error ? error.message : "图片解析不可用" };
+  }
+}

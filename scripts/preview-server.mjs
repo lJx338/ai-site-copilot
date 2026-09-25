@@ -9,6 +9,10 @@ import os from "node:os";
 import path from "node:path";
 import { build } from "vite";
 import react from "@vitejs/plugin-react";
+import sharp from "sharp";
+
+// 预览服务是单独的进程，拿不到 vinext 读取的 .env.local，这里自己读一次（图库和 AI 生图的 key）。
+try { process.loadEnvFile(path.join(process.cwd(), ".env.local")); } catch { /* no .env.local */ }
 
 const port = Number(process.env.AI_PREVIEW_SERVER_PORT || 5174);
 // The API route has a request-scoped filesystem, so it uses AI_WORKSPACE_ROOT
@@ -19,6 +23,8 @@ const workspaceBase = process.env.AI_PREVIEW_WORKSPACE_ROOT || path.join(process
 // 造成 Agent 已报告修改但下一次预览仍是旧版本。
 const previewWorkspaceBase = path.join(workspaceBase, ".preview-workspaces");
 const runsBase = path.join(workspaceBase, ".runs");
+// 图片是二进制文件，不走文本快照同步；按项目单独存放，由本服务提供访问地址。
+const assetsBase = path.join(workspaceBase, ".assets");
 const previewCache = new Map();
 const workspaceSignatures = new Map();
 const projectQueues = new Map();
@@ -359,7 +365,9 @@ const VISUAL_LINT = `(() => {
     const text = ownText(el);
     if (text || tag === "svg" || tag === "img" || tag === "canvas") {
       const clip = clipper(el);
-      if (clip && !scroller(el)) {
+      // 用省略号或行数限制有意截断的文字不算裁切
+      const truncated = (node) => { for (let p = node; p && p !== clip?.parentElement; p = p.parentElement) { const ps = getComputedStyle(p); if (ps.textOverflow === "ellipsis" || (ps.webkitLineClamp && ps.webkitLineClamp !== "none")) return true; } return false; };
+      if (clip && !scroller(el) && !(text && truncated(el))) {
         const c = clip.getBoundingClientRect();
         const cut = Math.max(c.left - r.left, r.right - c.right);
         if (cut > 6 && r.width < c.width * 3) {
@@ -507,6 +515,166 @@ async function archiveRun(runDir, projectId) {
   return { archived: true, screenshots };
 }
 
+// ---- 图片解析：Agent 用 <SiteImage> 声明需要什么图，这里负责找图或生成 ----
+const RATIO_SIZES = {
+  "21:9": [1920, 823], "16:9": [1600, 900], "3:2": [1500, 1000], "4:3": [1400, 1050],
+  "1:1": [1200, 1200], "3:4": [1050, 1400], "2:3": [1000, 1500], fill: [1600, 1000],
+};
+// Seedream 要求较高的像素总量，按比例给出约 2K 的尺寸
+const AI_SIZES = {
+  "21:9": "3024x1296", "16:9": "2560x1440", "3:2": "2496x1664", "4:3": "2304x1728",
+  "1:1": "2048x2048", "3:4": "1728x2304", "2:3": "1664x2496", fill: "2560x1440",
+};
+const COLLECT_IMAGES = `JSON.stringify([...document.querySelectorAll("[data-image-slot]")].map((el) => ({
+  slot: el.dataset.imageSlot, kind: el.dataset.imageKind || "photo", query: el.dataset.imageQuery || "",
+  prompt: el.dataset.imagePrompt || "", ratio: el.dataset.imageRatio || "16:9", alt: el.dataset.imageAlt || "",
+})))`;
+
+function assetsDir(projectId) {
+  return path.join(assetsBase, String(projectId || "default").replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 64) || "default");
+}
+
+async function readAssetIndex(projectId) {
+  try { return JSON.parse(await readFile(path.join(assetsDir(projectId), "index.json"), "utf8")); } catch { return {}; }
+}
+
+async function collectImageSlots(projectId) {
+  const root = realpathSync(projectRoot(projectId));
+  const { html } = await buildPreviewCached(projectId, root);
+  const chrome = findChrome();
+  if (!chrome) throw new Error("未找到浏览器，无法收集图片位");
+  const manifest = await readFile(path.join(root, "src/app/site-manifest.ts"), "utf8").catch(() => "");
+  const file = path.join(os.tmpdir(), `ai-site-images-${String(projectId).replace(/[^a-zA-Z0-9_-]/g, "-")}.html`);
+  await writeFile(file, html, "utf8");
+  const slots = new Map();
+  const duplicates = [];
+  await withCdp(chrome, async (send) => {
+    for (const route of routesFromManifest(manifest)) {
+      const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+      const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+      try {
+        await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+        await send("Page.navigate", { url: `${pathToFileURL(file).href}#${route}` }, sessionId);
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        const result = await send("Runtime.evaluate", { expression: COLLECT_IMAGES, returnByValue: true }, sessionId);
+        for (const item of JSON.parse(result.result.value || "[]")) {
+          if (!item.slot) continue;
+          const existing = slots.get(item.slot);
+          if (existing && (existing.query !== item.query || existing.prompt !== item.prompt)) duplicates.push(item.slot);
+          if (!existing) slots.set(item.slot, { ...item, route });
+        }
+      } finally {
+        await send("Target.closeTarget", { targetId }).catch(() => undefined);
+      }
+    }
+  });
+  return { slots: [...slots.values()], duplicates: [...new Set(duplicates)] };
+}
+
+function orientationOf(ratio) {
+  const [w, h] = RATIO_SIZES[ratio] || RATIO_SIZES["16:9"];
+  return w > h * 1.1 ? "landscape" : h > w * 1.1 ? "portrait" : "square";
+}
+
+async function searchPexels(query, ratio, usedIds) {
+  const key = process.env.PEXELS_API_KEY;
+  if (!key) throw new Error("没有配置 PEXELS_API_KEY");
+  const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&orientation=${orientationOf(ratio)}&per_page=15&size=large`;
+  const response = await fetch(url, { headers: { Authorization: key }, signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`Pexels HTTP ${response.status}`);
+  const payload = await response.json();
+  // 同一个网站里不重复使用同一张照片
+  return (payload.photos || []).find((photo) => !usedIds.has(String(photo.id))) || null;
+}
+
+async function toWebp(buffer, ratio) {
+  const [width, height] = RATIO_SIZES[ratio] || RATIO_SIZES["16:9"];
+  const output = await sharp(buffer).resize(width, height, { fit: "cover", position: "attention" }).webp({ quality: 78 }).toBuffer();
+  return { output, width, height };
+}
+
+async function generateWithSeedream(prompt, ratio) {
+  const key = process.env.ARK_API_KEY;
+  const endpoint = process.env.ARK_IMAGE_URL;
+  const model = process.env.ARK_IMAGE_MODEL;
+  if (!key || !endpoint || !model) throw new Error("没有配置 ARK_API_KEY / ARK_IMAGE_URL / ARK_IMAGE_MODEL");
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, prompt, size: AI_SIZES[ratio] || AI_SIZES["16:9"], response_format: "b64_json", watermark: false }),
+    signal: AbortSignal.timeout(120000),
+  });
+  const raw = await response.text();
+  let payload = {};
+  try { payload = JSON.parse(raw); } catch { /* keep raw */ }
+  const image = payload.data?.[0];
+  if (!response.ok || !image?.b64_json) throw new Error(`Seedream ${response.status}：${payload.error?.message || raw.slice(0, 200)}`);
+  return Buffer.from(image.b64_json, "base64");
+}
+
+// 解析所有图片位。已经解析过、描述没变的直接沿用；新的按 kind 决定先图库还是先 AI。
+async function resolveImages(projectId, style) {
+  const started = Date.now();
+  const { slots, duplicates } = await collectImageSlots(projectId);
+  const dir = assetsDir(projectId);
+  await mkdir(dir, { recursive: true });
+  const index = await readAssetIndex(projectId);
+  const usedIds = new Set(Object.values(index).map((item) => item.photoId).filter(Boolean).map(String));
+  const aiMax = Number(process.env.IMAGE_AI_MAX || 8);
+  let aiUsed = 0;
+  const port = Number(process.env.AI_PREVIEW_SERVER_PORT || 5174);
+  const manifest = {};
+  const stats = [];
+  await mapLimit(slots, 4, async (slot) => {
+    const itemStarted = Date.now();
+    const descriptor = `${slot.kind}|${slot.query}|${slot.prompt}|${slot.ratio}|${slot.kind === "product" || !slot.query ? style : ""}`;
+    const hash = createHash("sha1").update(descriptor).digest("hex").slice(0, 16);
+    const cached = index[hash];
+    if (cached && existsSync(path.join(dir, cached.file))) {
+      manifest[slot.slot] = { ...cached.asset, src: `http://127.0.0.1:${port}/assets/${path.basename(dir)}/${cached.file}` };
+      stats.push({ slot: slot.slot, route: slot.route, source: cached.asset.source, cached: true, ms: 0 });
+      return;
+    }
+    const order = slot.kind === "product" ? ["ai", "pexels"] : ["pexels", "ai"];
+    const errors = [];
+    for (const source of order) {
+      try {
+        if (source === "pexels") {
+          const photo = await searchPexels(slot.query || slot.alt, slot.ratio, usedIds);
+          if (!photo) { errors.push("图库没有搜到"); continue; }
+          usedIds.add(String(photo.id));
+          const download = await fetch(`${photo.src.original}?auto=compress&cs=tinysrgb&w=2000`, { signal: AbortSignal.timeout(30000) });
+          if (!download.ok) throw new Error(`下载失败 HTTP ${download.status}`);
+          const { output, width, height } = await toWebp(Buffer.from(await download.arrayBuffer()), slot.ratio);
+          const file = `${hash}.webp`;
+          await writeFile(path.join(dir, file), output);
+          const asset = { width, height, source: "pexels", credit: photo.photographer, creditUrl: photo.url };
+          index[hash] = { file, asset, photoId: photo.id, slot: slot.slot, query: slot.query };
+          manifest[slot.slot] = { ...asset, src: `http://127.0.0.1:${port}/assets/${path.basename(dir)}/${file}` };
+          stats.push({ slot: slot.slot, route: slot.route, source: "pexels", cached: false, ms: Date.now() - itemStarted, bytes: output.length, ...(errors.length ? { fallback: errors.join("；") } : {}) });
+          return;
+        }
+        if (aiUsed >= aiMax) { errors.push(`AI 生图已达上限 ${aiMax}`); continue; }
+        aiUsed += 1;
+        const prompt = [slot.prompt || slot.alt || slot.query, style].filter(Boolean).join("。");
+        const { output, width, height } = await toWebp(await generateWithSeedream(prompt, slot.ratio), slot.ratio);
+        const file = `${hash}.webp`;
+        await writeFile(path.join(dir, file), output);
+        const asset = { width, height, source: "ai" };
+        index[hash] = { file, asset, slot: slot.slot, prompt };
+        manifest[slot.slot] = { ...asset, src: `http://127.0.0.1:${port}/assets/${path.basename(dir)}/${file}` };
+        stats.push({ slot: slot.slot, route: slot.route, source: "ai", cached: false, ms: Date.now() - itemStarted, bytes: output.length, ...(errors.length ? { fallback: errors.join("；") } : {}) });
+        return;
+      } catch (error) {
+        errors.push(`${source}：${error instanceof Error ? error.message : String(error)}`.slice(0, 200));
+      }
+    }
+    stats.push({ slot: slot.slot, route: slot.route, source: "none", cached: false, ms: Date.now() - itemStarted, error: errors.join("；") });
+  });
+  await writeFile(path.join(dir, "index.json"), JSON.stringify(index, null, 2), "utf8");
+  return { slots: slots.length, duplicates, manifest, stats, ms: Date.now() - started };
+}
+
 function errorPage(message) {
   const escaped = message.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>预览构建失败</title><style>body{margin:0;padding:48px;font:16px/1.7 system-ui;color:#3d342c;background:#f8f5ef}main{max-width:720px;margin:auto;padding:32px;border:1px solid #e5d9cc;border-radius:20px;background:#fff}h1{font-size:22px}pre{white-space:pre-wrap;color:#8b4935}</style></head><body><main><h1>当前项目暂时无法预览</h1><p>系统已把完整的 TypeScript 或构建诊断交给 Agent；修复成功后会自动重新展示。</p><pre>${escaped}</pre></main></body></html>`;
@@ -622,6 +790,33 @@ const server = createServer(async (request, response) => {
     } catch (error) {
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       response.end(JSON.stringify({ skipped: true, reason: error instanceof Error ? error.message : "视觉检查失败", pages: [] }));
+    }
+    return;
+  }
+  if (url.pathname === "/images/resolve" && request.method === "POST") {
+    try {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      const projectId = String(payload.projectId || "coffee-studio");
+      const result = await enqueue(projectId, () => resolveImages(projectId, String(payload.style || "")));
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify(result));
+    } catch (error) {
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify({ skipped: true, reason: error instanceof Error ? error.message : "图片解析失败" }));
+    }
+    return;
+  }
+  if (url.pathname.startsWith("/assets/") && request.method === "GET") {
+    const [, , projectDir, file] = url.pathname.split("/");
+    if (!projectDir || !file || /[^a-zA-Z0-9_.-]/.test(projectDir + file)) { response.writeHead(400); response.end(); return; }
+    try {
+      const data = await readFile(path.join(assetsBase, projectDir, file));
+      response.writeHead(200, { "content-type": file.endsWith(".webp") ? "image/webp" : "application/octet-stream", "cache-control": "public, max-age=31536000, immutable", "access-control-allow-origin": "*" });
+      response.end(data);
+    } catch {
+      response.writeHead(404); response.end();
     }
     return;
   }

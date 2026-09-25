@@ -117,6 +117,8 @@ export class RunTelemetry {
   finalFiles: Array<{ path: string; bytes: number }> = [];
   // 代码层面的自动修复（不花模型费用），以及用于和其他运行对比的质量指标
   autofixes: Array<{ stage: string; fixes: string[] }> = [];
+  // 图片解析：每个图片位的来源（图库 / AI / 未解析）、是否沿用缓存、耗时
+  images: Array<{ stage: string; slot: string; route?: string; source: string; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string }> = [];
   quality?: {
     passed: boolean;
     pages: Array<{ route: string; file: string; stub: boolean; codeBytes: number; cssBytes: number; files: number; renderedChars?: number }>;
@@ -244,6 +246,12 @@ export class RunTelemetry {
       topCalls: [...this.llmCalls].sort((a, b) => b.costCny - a.costCny).slice(0, 12),
       finalFiles: this.finalFiles,
       autofixes: this.autofixes,
+      images: (() => {
+        // 同一图片位可能在多轮里出现，取最后一次的结果
+        const latest = new Map(this.images.map((item) => [item.slot, item]));
+        const items = [...latest.values()];
+        return { slots: items.length, pexels: items.filter((item) => item.source === "pexels").length, ai: items.filter((item) => item.source === "ai").length, failed: items.filter((item) => item.source === "none").length, newlyResolved: this.images.filter((item) => !item.cached && item.source !== "none").length, ms: this.images.reduce((total, item) => total + item.ms, 0), failures: items.filter((item) => item.error).map((item) => `${item.slot}：${item.error}`).slice(0, 10), fallbacks: items.filter((item) => item.fallback).map((item) => `${item.slot}：${item.fallback}`).slice(0, 10) };
+      })(),
       quality: this.quality,
     };
   }
@@ -305,6 +313,7 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
       ...summary.quality.pages.map((page) => `  ${page.route.padEnd(18)} ${page.stub ? "骨架" : "完成"} · 代码 ${(page.codeBytes / 1000).toFixed(1)}k · 样式 ${(page.cssBytes / 1000).toFixed(1)}k · 渲染字数 ${page.renderedChars ?? "-"}`),
     ] : []),
     ...(summary.quality?.visual && !summary.quality.visual.skipped ? [`视觉：${summary.quality.visual.overall} 分 · ${Object.entries(summary.quality.visual.scores).map(([key, value]) => `${key} ${value}`).join(" ")} · 浏览器检查必须修 ${summary.quality.visual.lintMust} 处`] : []),
+    ...(summary.images.slots ? [`图片：${summary.images.slots} 个图片位 · 图库 ${summary.images.pexels} · AI ${summary.images.ai} · 未解析 ${summary.images.failed} · 新解析 ${summary.images.newlyResolved} 张`] : []),
     ...(summary.autofixes.length ? [`代码自动修复：${summary.autofixes.map((item) => `${item.stage}(${item.fixes.length})`).join("、")}`] : []),
     "-- 按阶段 --",
     ...summary.stages.map((stage) => `  ${stage.stage.padEnd(22)} ${s(stage.ms)}`),

@@ -1,5 +1,5 @@
 import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles } from "../../../../lib/project-workspace";
-import { applyAutoFixes, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
+import { applyAutoFixes, applySiteImages, classifyIntent, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
 import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
 
@@ -139,6 +139,8 @@ export async function POST(request: Request) {
             enterStage(`check_${repairRound}`);
             const fixes = await applyAutoFixes(root, `check_${repairRound}`);
             if (fixes.length) await emit({ type: "autofix", label: `代码自动修复了 ${fixes.length} 个问题`, error: fixes.slice(0, 3).join("；") });
+            // 配图需要能构建的页面；构建失败时跳过，修复后的下一轮会再解析
+            await applySiteImages(projectId, root, emit, `check_${repairRound}`).catch(() => undefined);
             let checkStarted = Date.now();
             try {
               await syncWorkspaceToPreview(projectId, root);
