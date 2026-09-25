@@ -13,6 +13,7 @@ export type LlmCall = {
   purpose: string;
   model: string;
   thinking: boolean;
+  effort?: string;
   maxTokens?: number;
   messageCount: number;
   requestChars: number;
@@ -190,6 +191,8 @@ export class RunTelemetry {
       outcome: this.outcome,
       error: this.error,
       wallMs: (this.finishedAt ?? Date.now()) - this.startedAt,
+      // 本次运行的关键配置，对比时用来区分实验组
+      config: { model: process.env.DEEPSEEK_MODEL || "deepseek-flash", agentReasoningEffort: process.env.AI_AGENT_REASONING_EFFORT || "high", intentProvider: process.env.TYPESAFE_API_KEY ? "jev" : "deepseek" },
       pricing: { ...pricing, model: process.env.DEEPSEEK_MODEL || "deepseek-flash", peakPrices: peakPrices(process.env.DEEPSEEK_MODEL || "deepseek-flash"), peakCalls: deepseek.filter((call) => call.peak).length, offPeakCalls: deepseek.filter((call) => !call.peak).length },
       totals: {
         costCny: round(Object.values(costOf).reduce((total, value) => total + value, 0)),
@@ -284,7 +287,7 @@ export function formatSummaryTable(summary: ReturnType<RunTelemetry["summary"]>)
   const s = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
   const t = summary.totals;
   const lines = [
-    `===== 运行报告 ${summary.runId} · ${summary.intent ?? "?"} · ${summary.outcome ?? "?"} =====`,
+    `===== 运行报告 ${summary.runId} · ${summary.intent ?? "?"} · ${summary.outcome ?? "?"} · Agent 思考强度 ${summary.config.agentReasoningEffort} =====`,
     `总费用 ≈ ¥${t.costCny}（按高峰价换算 ¥${t.costAtPeakCny}；按调用时间计 ${summary.pricing.peakCalls} 次高峰 / ${summary.pricing.offPeakCalls} 次空闲价；全部空闲时段约 ¥${t.costIfOffPeakCny}）`,
     `  构成：缓存命中输入 ¥${t.costBreakdownCny.cacheHit} / 未命中输入 ¥${t.costBreakdownCny.cacheMiss} / 正文输出 ¥${t.costBreakdownCny.output} / 思考 ¥${t.costBreakdownCny.reasoning} / Jev ¥${t.costBreakdownCny.jev}）`,
     `总用时 ${s(summary.wallMs)} · 模型调用 ${t.llmCalls} 次 · 输入 ${k(t.promptTokens)}（缓存命中率 ${Math.round(t.cacheHitRate * 100)}%）· 输出 ${k(t.completionTokens)}（其中思考 ${Math.round(t.reasoningShareOfOutput * 100)}%）· 截断 ${t.truncatedCalls} · 工具调用 ${t.toolCalls}（失败 ${t.failedToolCalls}）· 修复 ${t.repairRounds} 轮`,

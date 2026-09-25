@@ -4,13 +4,15 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { listWorkspaceFiles, pageMetrics } from "../lib/project-workspace";
+import type { RunTelemetry } from "../lib/telemetry";
 
 const runsDir = path.join(process.cwd(), ".ai-site-copilot-workspaces/.runs");
 const [baseId, nextArg] = process.argv.slice(2);
 const nextId = nextArg || readFileSync(path.join(runsDir, "latest.txt"), "utf8").trim();
 if (!baseId) throw new Error("用法：npm run compare:runs -- <基线 runId> [新 runId]");
 
-type Summary = Record<string, any>;
+// 旧报告可能缺少后来加入的字段（config、quality、costAtPeakCny），读取时都要容错。
+type Summary = Partial<ReturnType<RunTelemetry["summary"]>> & Pick<ReturnType<RunTelemetry["summary"]>, "totals" | "agents" | "byStage" | "wallMs" | "message" | "outcome">;
 
 async function load(runId: string) {
   const dir = path.join(runsDir, runId);
@@ -35,8 +37,9 @@ function agentsStat(summary: Summary) {
 }
 
 const rows: Array<[string, string, string, string]> = [];
-const add = (label: string, x: number | string, y: number | string, format: (v: any) => string = String, showDelta = true) => {
-  rows.push([label, format(x), format(y), showDelta && typeof x === "number" && typeof y === "number" ? delta(x, y) : ""]);
+const add = (label: string, x: number | string | undefined, y: number | string | undefined, format: (v: number) => string = String, showDelta = true) => {
+  const show = (v: number | string | undefined) => typeof v === "number" ? format(v) : String(v ?? "-");
+  rows.push([label, show(x), show(y), showDelta && typeof x === "number" && typeof y === "number" ? delta(x, y) : ""]);
 };
 const ta = a.summary.totals;
 const tb = b.summary.totals;
@@ -47,6 +50,7 @@ const sumCode = (pages: typeof a.pages) => pages.reduce((total, page) => total +
 const sumChars = (run: typeof a) => Object.values(run.render).reduce((total, item) => total + (item.chars ?? 0), 0);
 
 add("结果", a.summary.outcome, b.summary.outcome);
+add("Agent 思考强度", a.summary.config?.agentReasoningEffort ?? "high", b.summary.config?.agentReasoningEffort ?? "high");
 add("费用（按高峰价换算）¥", ta.costAtPeakCny ?? ta.costCny, tb.costAtPeakCny ?? tb.costCny, (v) => v.toFixed(2));
 add("费用（实际）¥", ta.costCny, tb.costCny, (v) => v.toFixed(2));
 add("用时 秒", a.summary.wallMs / 1000, b.summary.wallMs / 1000, (v) => String(Math.round(v)));

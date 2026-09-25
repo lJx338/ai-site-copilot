@@ -215,7 +215,17 @@ type DeepSeekRequestOptions = {
   maxTokens?: number;
   // 观测用：这次调用做什么（plan / prd / design / agent_turn / review / intent …）
   purpose?: string;
+  // 思考强度：none 关闭思考，low / high / max 开启（DeepSeek 默认 high）
+  reasoningEffort?: ReasoningEffort;
 };
+
+type ReasoningEffort = "none" | "low" | "high" | "max";
+
+// 写代码的 Agent 使用的思考强度，用于对比测试。默认 high，与之前的行为一致。
+export function agentReasoningEffort(): ReasoningEffort {
+  const value = process.env.AI_AGENT_REASONING_EFFORT;
+  return value === "none" || value === "low" || value === "max" ? value : "high";
+}
 
 type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
 type DeepSeekReply = { message: ChatMessage; finishReason: string; usage?: DeepSeekUsage };
@@ -246,7 +256,8 @@ async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options:
       turn: scope.turn,
       purpose: options.purpose ?? "other",
       model,
-      thinking: (options.thinking?.type ?? "enabled") === "enabled",
+      thinking: options.reasoningEffort === "none" ? false : (options.thinking?.type ?? "enabled") === "enabled",
+      effort: options.reasoningEffort === "none" || options.thinking?.type === "disabled" ? "none" : options.reasoningEffort ?? "high",
       maxTokens: options.maxTokens,
       messageCount: messages.length,
       requestChars: messages.reduce((total, message) => total + (message.content?.length ?? 0) + (message.reasoning_content?.length ?? 0) + (message.tool_calls ? JSON.stringify(message.tool_calls).length : 0), 0),
@@ -277,7 +288,8 @@ async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options:
 }
 
 async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], options: DeepSeekRequestOptions, meta: { attempts: number }): Promise<DeepSeekReply> {
-  const thinking = options.thinking || { type: "enabled" as const };
+  const effort = options.reasoningEffort ?? "high";
+  const thinking = effort === "none" ? { type: "disabled" as const } : options.thinking || { type: "enabled" as const };
   // DeepSeek 的 thinking + tools 会在每一轮继续推理，tool_choice 不是这个
   // 会话的控制点。尤其是 named/required choice 会被 API 直接拒绝；auto
   // 也是 tools 存在时的默认值，因此在 thinking 模式下不发送该字段最稳妥。
@@ -298,7 +310,7 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
       ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
       thinking,
       ...(maxTokens ? { max_tokens: maxTokens } : {}),
-      ...(thinking.type === "disabled" ? { temperature: 0.15 } : { reasoning_effort: "high" }),
+      ...(thinking.type === "disabled" ? { temperature: 0.15 } : { reasoning_effort: effort === "none" ? "high" : effort }),
     };
     let response: Response;
     try {
@@ -669,7 +681,7 @@ async function runAgentLoop(options: AgentOptions, agentName: string): Promise<A
   try {
     for (let turn = 0; turn < turnLimit; turn += 1) {
       record.turns = turn + 1;
-      const { message: assistant, usage, finishReason } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, maxTokens: 32000, purpose: "agent_turn" }));
+      const { message: assistant, usage, finishReason } = await withScope({ turn: turn + 1 }, () => deepSeekRequest(options.apiKey, messages, { tools: options.tools, maxTokens: 32000, purpose: "agent_turn", reasoningEffort: agentReasoningEffort() }));
       record.promptTokensByTurn.push(usage?.prompt_tokens ?? 0);
       messages.push(assistant);
       if (!assistant.tool_calls?.length) {
