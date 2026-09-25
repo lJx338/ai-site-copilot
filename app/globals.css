@@ -1,0 +1,27 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "../vendor/shadcn-tailwind-4.13.0.css";
+
+@utility scrollbar-none {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+:root {
+  --background: #f7f7f5;
+  --foreground: #242321;
+  --font-sans: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { margin: 0; background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
+button, textarea { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
