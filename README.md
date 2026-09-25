@@ -28,6 +28,10 @@ pnpm run dev
 
 运行观测：每次请求都会记录每次模型调用（阶段、Agent、轮次、输入 token 的缓存命中/未命中、输出与思考 token、截断、耗时、按调用时间的高峰/空闲价估算费用）、每次工具调用、每个 Agent 的轮数和结束方式、自检结果、每轮校验和修复面对的问题。结束时在 dev 终端打印汇总表，并把 `report.json`、`summary.txt` 和每个 Agent 的完整对话保存在 `.ai-site-copilot-workspaces/.runs/<runId>/`（`latest.txt` 指向最近一次）。价格表在 `lib/telemetry.ts`，可用 `DEEPSEEK_PRICE_*` 覆盖。
 
+Agent 执行约束：每个写代码的 Agent 一开始就知道自己的轮数预算，剩 3 轮以内会被要求停止阅读、立即写入；页面 Agent 第 1 轮同时写出页面、数据和样式文件，只能用读/写/补丁三个工具，不能读取其他页面；机械性问题（缺失的样式文件、未注册的路由）由 `autoFixProject()` 直接修复；修复阶段按"代码自动修复 → 重跑骨架页的页面 Agent → 只把剩余问题交给修复 Agent"升级。写代码 Agent 的思考强度由 `AI_AGENT_REASONING_EFFORT` 控制（默认 high）。
+
+评估：每次运行在 `.ai-site-copilot-workspaces/.runs/<runId>/` 归档成品（`site/`、单文件 `site.html`）、桌面和手机整页截图（`screens/`）和逐页渲染数据（`render.json`）。用 `npm run compare:runs -- <基线 runId> [新 runId]` 对比两次运行的费用、用时、Agent 行为、修复过程和页面质量。
+
 内容策略：用户没提供的事实由 Agent 补全成可信、具体、全站一致的示例内容，并列在 `docs/content-todo.md` 里方便替换；页面上不允许出现占位写法。
 
 浏览器检查会依次查找 `CHROME_PATH`、Playwright 缓存里的 headless shell（最快）和系统安装的 Chrome/Chromium/Edge；都找不到时跳过，不阻塞建站。`DEEPSEEK_MAX_TOKENS` 可以调整单次请求的输出上限（默认 32000）。
