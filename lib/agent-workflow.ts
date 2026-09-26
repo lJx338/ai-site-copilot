@@ -235,7 +235,7 @@ export function agentReasoningEffort(): ReasoningEffort {
   return value === "none" || value === "low" || value === "max" ? value : "high";
 }
 
-type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
+type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } };
 type DeepSeekReply = { message: ChatMessage; finishReason: string; usage?: DeepSeekUsage };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -250,7 +250,8 @@ async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options:
   const record = (reply?: DeepSeekReply, error?: unknown) => {
     if (!run) return;
     const usage = reply?.usage ?? {};
-    const hit = usage.prompt_cache_hit_tokens ?? 0;
+    // 官方 DeepSeek 用 prompt_cache_hit_tokens；OpenAI 兼容的中转（如 new-api）放在 prompt_tokens_details.cached_tokens。
+    const hit = usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0;
     const miss = usage.prompt_cache_miss_tokens ?? Math.max(0, (usage.prompt_tokens ?? 0) - hit);
     const completion = usage.completion_tokens ?? 0;
     const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0;
@@ -537,6 +538,8 @@ async function reviewPageVisual(apiKey: string, route: string, desktop: PageScre
 // 整站视觉审查：浏览器客观检查 + 逐页看图打分。页面之间并行。
 export async function visualReview(apiKey: string, projectId: string, maxTiles = 6): Promise<VisualReview> {
   const empty = Object.fromEntries(visualDimensions.map((dimension) => [dimension, 0])) as Record<VisualDimension, number>;
+  // 部分中转不转发图片（模型只收到文字，会凭空打分），这时用 AI_VISUAL_REVIEW=off 关掉看图审查和随后的视觉修复。
+  if (process.env.AI_VISUAL_REVIEW === "off") return { overall: 0, scores: empty, pages: [], lintMust: 0, lintShould: 0, skipped: "已关闭（AI_VISUAL_REVIEW=off）" };
   const screens = await fetchScreens(projectId, maxTiles);
   if (screens.skipped || !screens.pages.length) return { overall: 0, scores: empty, pages: [], lintMust: 0, lintShould: 0, skipped: screens.reason || "没有可审查的页面" };
   const routes = [...new Set(screens.pages.map((page) => page.route))];
