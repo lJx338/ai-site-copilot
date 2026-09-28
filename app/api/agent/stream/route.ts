@@ -44,7 +44,9 @@ export async function POST(request: Request) {
   try { body = await request.json() as typeof body; } catch { return Response.json({ error: "请求格式不正确" }, { status: 400 }); }
   const message = body.message?.trim();
   const projectId = body.projectId?.trim() || "coffee-studio";
-  const apiKey = body.apiKey?.trim() || process.env.DEEPSEEK_API_KEY || "";
+  // 服务端 .env.local 配了 key 就以它为准：页面输入框存在浏览器里，换了模型平台后
+  // 旧 key 会一直残留并覆盖新配置。页面输入框只在服务端没配置时使用。
+  const apiKey = process.env.DEEPSEEK_API_KEY || body.apiKey?.trim() || "";
   const history = formatHistory(body.history);
   if (!message) return Response.json({ error: "请先描述你想创建或修改的网站" }, { status: 400 });
   if (!apiKey) return Response.json({ error: "请先填写 DeepSeek API Key" }, { status: 400 });
