@@ -226,6 +226,21 @@ async function dumpDom(chrome, url) {
   }
 }
 
+// --dump-dom 在部分页面上会让无头浏览器直接崩溃（exit 133，关掉图片和 GPU 也一样），
+// 而 DevTools 协议打开同一页面正常。崩溃时改用协议取渲染后的 DOM，别让页面漏检。
+async function dumpDomCdp(chrome, url) {
+  return withCdp(chrome, async (send) => {
+    const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+    const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+    await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false }, sessionId);
+    await send("Page.navigate", { url }, sessionId);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForApp(send, sessionId);
+    const result = await send("Runtime.evaluate", { expression: "document.documentElement.outerHTML", returnByValue: true }, sessionId);
+    return String(result.result.value || "");
+  });
+}
+
 async function mapLimit(items, limit, task) {
   const results = new Array(items.length);
   let next = 0;
@@ -244,8 +259,12 @@ async function inspectSite(projectId, html, manifest) {
   await writeFile(file, html.includes("<head>") ? html.replace("<head>", `<head>${inspectProbe}`) : `${inspectProbe}${html}`, "utf8");
   const notFoundRoute = "/__inspect_not_found__";
   const pages = await mapLimit([...routes, notFoundRoute], 3, async (route) => {
-    try { return { route, ...analyzeDom(await dumpDom(chrome, `${pathToFileURL(file).href}#${route}`)) }; }
-    catch (error) { return { route, failed: error instanceof Error ? error.message.slice(0, 200) : "浏览器检查失败", errors: [], text: "", links: [] }; }
+    const url = `${pathToFileURL(file).href}#${route}`;
+    try { return { route, ...analyzeDom(await dumpDom(chrome, url)) }; }
+    catch {
+      try { return { route, via: "cdp", ...analyzeDom(await dumpDomCdp(chrome, url)) }; }
+      catch (error) { return { route, failed: error instanceof Error ? error.message.slice(0, 200) : "浏览器检查失败", errors: [], text: "", links: [] }; }
+    }
   });
   const byRoute = new Map(pages.map((page) => [page.route, page]));
   const home = byRoute.get("/");
@@ -266,7 +285,7 @@ async function inspectSite(projectId, html, manifest) {
     ok: issues.length === 0,
     skipped: failed.length === pages.length,
     issues,
-    routes: pages.filter((page) => page.route !== notFoundRoute).map((page) => ({ route: page.route, chars: page.text.length, errors: page.errors.length, failed: page.failed })),
+    routes: pages.filter((page) => page.route !== notFoundRoute).map((page) => ({ route: page.route, chars: page.text.length, errors: page.errors.length, failed: page.failed, ...(page.via ? { via: page.via } : {}) })),
   };
 }
 
