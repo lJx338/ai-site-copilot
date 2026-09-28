@@ -115,12 +115,20 @@ async function parsePdf(buffer) {
     }
     if (line.trim()) out.push(line.trim());
     pageTexts.push(`## 第 ${number} 页\n${out.join("\n")}`);
-    // 整页图：宽 1400px
+    // 整页图给看图模型读表格和证书：字太小会读错（1400px 宽的跨页画册把 FPC 读成 FR4），
+    // 所以按每半页约 1400px 的分辨率渲染；横版跨页切成左右两半分别识别。
     const base = page.getViewport({ scale: 1 });
-    const viewport = page.getViewport({ scale: 1400 / base.width });
+    const spread = base.width > base.height * 1.2;
+    const viewport = page.getViewport({ scale: (spread ? 2800 : 1600) / base.width });
     const canvas = doc.canvasFactory.create(Math.round(viewport.width), Math.round(viewport.height));
     await page.render({ canvasContext: canvas.context, viewport }).promise;
-    pages.push({ page: number, data: await sharp(canvas.canvas.toBuffer("image/png")).flatten({ background: "#ffffff" }).jpeg({ quality: 80 }).toBuffer(), textChars: out.join("").length });
+    const rendered = await sharp(canvas.canvas.toBuffer("image/png")).flatten({ background: "#ffffff" }).jpeg({ quality: 82 }).toBuffer();
+    const textChars = out.join("").length;
+    if (spread) {
+      const { width, height } = await sharp(rendered).metadata();
+      const half = Math.floor(width / 2);
+      for (const [label, left] of [["左半", 0], ["右半", half]]) pages.push({ page: number, part: label, data: await sharp(rendered).extract({ left, top: 0, width: half, height }).jpeg({ quality: 82 }).toBuffer(), textChars });
+    } else pages.push({ page: number, data: rendered, textChars });
     // 嵌入照片：遍历绘图指令里的图片对象
     const ops = await page.getOperatorList();
     const seen = new Set();
@@ -192,7 +200,7 @@ export async function ingestMaterials(dir) {
     for (const page of parsed.pages) {
       const id = `p${pages.length + 1}`;
       await writeFile(path.join(dir, "pages", `${id}.jpg`), page.data);
-      pages.push({ id, file: `pages/${id}.jpg`, from: `${name} 第 ${page.page} 页`, textChars: page.textChars });
+      pages.push({ id, file: `pages/${id}.jpg`, from: `${name} 第 ${page.page} 页${page.part ? `（${page.part}）` : ""}`, textChars: page.textChars });
     }
     for (const image of parsed.images) {
       let jpeg;

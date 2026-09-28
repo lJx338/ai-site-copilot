@@ -86,17 +86,17 @@ async function classifyImages(apiKey: string, images: MaterialImage[], state: Vi
   return notes;
 }
 
-const pagePrompt = `你在读一家企业资料的一页（整页图 + 这一页的文字层）。文字层可能丢失表格结构，也读不到图片里的文字。
-只补充文字层里没有、或结构丢失的信息，用 Markdown 输出，没有就写“无补充”：
-- 表格：按原表还原成 Markdown 表格（表头、合并单元格按行展开）。
+const pagePrompt = `你在读一家企业资料的一页（整页图 + 这一页的文字层；跨页画册会切成左半、右半分别给你，文字层是整页的）。文字层可能丢失表格结构，也读不到图片里的文字。
+用 Markdown 输出下面几类信息，这一页都没有就写“无补充”：
+- 表格：页面上只要有表格，就按图完整还原成 Markdown 表格（表头照抄，合并单元格按行展开，每一行都写全项目和数值）。文字层里的表格一定是错位的，即使文字层里有同样的字也要还原，不能省略。
 - 证书、奖牌、牌匾：逐个写出名称和颁发机构（能看清的）。
 - logo：写出能认出的公司或品牌名。
 - 照片：一句话概括这一页照片的主题（例如“车间 SMT 产线和 AOI 设备照片 12 张”）。
 - 品牌视觉：如果这一页有这家企业自己的 logo 或主视觉，给出品牌主色的十六进制色值。
-不要复述文字层里已经有的内容，不要推测看不清的文字。`;
+除了表格，不要复述文字层里已经有的内容；不要推测看不清的文字。`;
 
 function pageTextLayer(index: MaterialIndex, from: string) {
-  const match = from.match(/^(.*) 第 (\d+) 页$/);
+  const match = from.match(/^(.*) 第 (\d+) 页(?:（.+）)?$/);
   if (!match) return "";
   const file = index.files.find((item) => item.name === match[1]);
   const section = (file?.text ?? "").split(/\n(?=## 第 \d+ 页)/).find((part) => part.startsWith(`## 第 ${match[2]} 页`));

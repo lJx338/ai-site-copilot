@@ -916,12 +916,13 @@ const server = createServer(async (request, response) => {
         result = { ok: true };
       } else if (url.pathname === "/materials/ingest") {
         const index = await ingestMaterials(dir);
-        // 附上缩小后的图片给看图模型：素材图长边 768，整页图 1400
-        const encode = async (file, size) => (await sharp(await readFile(path.join(dir, file))).resize(size, size, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 78 }).toBuffer()).toString("base64");
+        // 附上缩小后的图片给看图模型：素材图长边 768；整页图保持约 1400×1900，字才读得准。
+        // 单张太大（例如 850KB 的整页长截图）会被接口直接拒绝。
+        const encode = async (file, width, height = width) => (await sharp(await readFile(path.join(dir, file))).resize(width, height, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 80 }).toBuffer()).toString("base64");
         result = {
           ...index,
           images: await Promise.all(index.images.map(async (image) => ({ ...image, b64: image.grade === "blank" ? "" : await encode(image.file, 768) }))),
-          pages: await Promise.all(index.pages.map(async (page) => ({ ...page, b64: await encode(page.file, 1400) }))),
+          pages: await Promise.all(index.pages.map(async (page) => ({ ...page, b64: await encode(page.file, 1600, 2000) }))),
         };
       } else { response.writeHead(404); response.end(); return; }
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
