@@ -240,6 +240,13 @@ type DeepSeekReply = { message: ChatMessage; finishReason: string; usage?: DeepS
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 带截图的请求（看图审查、视觉修复）改用 DEEPSEEK_VISION_MODEL：有的平台上主模型不收图片，
+// 例如腾讯 TokenHub 的 deepseek-flash 会直接拒绝，而 deepseek-v4.1-flash 能看图。
+function requestModel(messages: ChatMessage[]) {
+  const hasImages = messages.some((message) => Array.isArray(message.content));
+  return (hasImages && process.env.DEEPSEEK_VISION_MODEL) || process.env.DEEPSEEK_MODEL || "deepseek-flash";
+}
+
 // 每次调用都记录 token、缓存命中、思考 token、耗时和估算费用。
 async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options: DeepSeekRequestOptions = {}): Promise<DeepSeekReply> {
   const run = currentRun();
@@ -255,7 +262,7 @@ async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options:
     const miss = usage.prompt_cache_miss_tokens ?? Math.max(0, (usage.prompt_tokens ?? 0) - hit);
     const completion = usage.completion_tokens ?? 0;
     const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0;
-    const model = process.env.DEEPSEEK_MODEL || "deepseek-flash";
+    const model = requestModel(messages);
     const priced = deepseekCost(model, hit, miss, completion, reasoning, new Date(started));
     run.llmCalls.push({
       seq: run.nextSeq(),
@@ -313,7 +320,7 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
   for (let attempt = 0; ; attempt += 1) {
     meta.attempts = attempt + 1;
     const requestBody = {
-      model: process.env.DEEPSEEK_MODEL || "deepseek-flash",
+      model: requestModel(messages),
       messages,
       ...(options.tools ? { tools: options.tools } : {}),
       ...(thinking.type === "disabled" && options.toolChoice !== undefined ? { tool_choice: options.toolChoice } : {}),
@@ -340,8 +347,10 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
         const payload = JSON.parse(raw) as { error?: { message?: string } | string; message?: string };
         detail = typeof payload.error === "string" ? payload.error : payload.error?.message || payload.message || detail;
       } catch { /* keep the raw response */ }
-      // 并行页面 Agent 更容易触发限流；服务端错误和限流都值得重试。
-      if ((response.status === 429 || response.status >= 500) && attempt < 3) { await sleep(3000 * (attempt + 1)); continue; }
+      // 并行页面 Agent 更容易触发限流；服务端错误和限流都值得重试。限流多是按分钟计的
+      // TPM/RPM（如 TokenHub 每分钟 100 万 token），要等到下一分钟才恢复，所以等得更久。
+      if (response.status === 429 && attempt < 5) { await sleep(10000 * (attempt + 1)); continue; }
+      if (response.status >= 500 && attempt < 3) { await sleep(3000 * (attempt + 1)); continue; }
       if (response.status === 400 && maxTokens && maxTokens > 8192 && /max_tokens/i.test(detail)) { maxTokens = 8192; continue; }
       if (response.status === 401) detail = `API Key 无效或已过期：${detail}`;
       if (response.status === 402) detail = `账户余额不足或未开通 API：${detail}`;
