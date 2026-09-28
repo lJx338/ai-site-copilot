@@ -47,7 +47,7 @@ async function visionRequest(apiKey: string, system: string, content: unknown[],
 }
 
 const classifyPrompt = `你在整理一家企业上传的资料图片，为建设官网挑选素材。逐张判断，只输出 JSON：
-{"images":[{"id":"m1","kind":"${IMAGE_KINDS.join("|")}","subject":"画面内容，中文 25 字以内","text":"图中能读出的关键文字：logo 上的公司或品牌名、证书名称和颁发机构、设备型号；没有就写空字符串","usable":true,"note":"不适合放上官网的原因（模糊、纯底图、画面残缺、含身份证手机号等隐私），适合就写空字符串"}]}
+{"images":[{"id":"m1","kind":"${IMAGE_KINDS.join("|")}","subject":"画面内容，中文 25 字以内","text":"图中能读出的关键文字：logo 写认得出的公司名（例如只写着 life.augmented 的蓝色 ST 标志写“ST 意法半导体”）、证书名称和颁发机构、设备型号；没有就写空字符串","usable":true,"note":"不适合放上官网的原因（模糊、纯底图、画面残缺、含身份证手机号等隐私），适合就写空字符串"}]}
 kind 说明：logo 是公司或品牌标志；certificate 是证书、牌匾、奖杯；background 是没有主体的底图、渐变、纹理；decoration 是图标、线条、边框这类装饰。`;
 
 // 看图失败的原因。401/402（key 无效、余额不足）时后面的请求也会失败，直接停止，不再浪费时间。
