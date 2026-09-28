@@ -22,6 +22,7 @@ import { classifyWithJev } from "./intent-jev";
 import { currentRun, currentScope, deepseekCost, enterStage, withScope, type AgentRecord } from "./telemetry";
 import { fetchScreens, resolveImages, syncWorkspaceToPreview, typecheckWorkspace, validatePreview, type PageScreens, type ValidationResult } from "./preview-client";
 import { templateFiles } from "./project-template";
+import { briefSection, materialsPolicy, readBrief } from "./materials-brief";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -93,6 +94,11 @@ export const contentPolicy = `内容规则（非常重要）：
 - 全站共用事实放在 src/content/site.ts，页面从这里导入，保证各页面一致；你补全的示例事实记录在 docs/content-todo.md，方便上线前替换。
 - 每个页面至少 4 个内容充实的区块：要有具体的标题、正文、列表项、数字、价格或时间，不能只有一句话或空卡片。
 - 内部链接只能指向已注册的路由。`;
+
+// 有客户资料时在内容规则后面追加资料规则（资料优先，缺的才补）
+async function contentRules(root: string | undefined) {
+  return (await readBrief(root)) ? `${contentPolicy}\n\n${materialsPolicy}` : contentPolicy;
+}
 
 export const sitemapPrompt = `你是 AI 建站产品经理。先为这次需求做结构化规划，不写代码，也不写长文档。
 
@@ -236,7 +242,7 @@ export function agentReasoningEffort(): ReasoningEffort {
 }
 
 type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } };
-type DeepSeekReply = { message: ChatMessage; finishReason: string; usage?: DeepSeekUsage };
+export type DeepSeekReply = { message: ChatMessage; finishReason: string; usage?: DeepSeekUsage };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -248,7 +254,7 @@ function requestModel(messages: ChatMessage[]) {
 }
 
 // 每次调用都记录 token、缓存命中、思考 token、耗时和估算费用。
-async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options: DeepSeekRequestOptions = {}): Promise<DeepSeekReply> {
+export async function deepSeekRequest(apiKey: string, messages: ChatMessage[], options: DeepSeekRequestOptions = {}): Promise<DeepSeekReply> {
   const run = currentRun();
   const scope = currentScope();
   const startedMs = run?.now() ?? 0;
@@ -366,7 +372,7 @@ async function deepSeekRequestOnce(apiKey: string, messages: ChatMessage[], opti
   }
 }
 
-async function requestJson(apiKey: string, messages: ChatMessage[], purpose: string) {
+export async function requestJson(apiKey: string, messages: ChatMessage[], purpose: string) {
   let current = messages;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const { message, finishReason } = await deepSeekRequest(apiKey, current, { responseFormat: { type: "json_object" }, purpose });
@@ -576,9 +582,11 @@ export async function reviewSite(apiKey: string, projectId: string, message: str
     return `\n--- ${file.path} ---\n${content}`;
   }).join("\n");
   const skillContext = (await loadSiteSkills(root, ["site-review"])).slice(0, 12000);
+  const brief = await readBrief(root);
+  const factRule = brief ? "本项目有客户资料卡：网站上与资料卡矛盾的事实（数字、年份、资质、联系方式、参数），以及资料里没有却写成事实的资质、证书、专利、奖项、客户名称、客户评价、合作案例，都属于 blockingIssues，写明文件和原文。资料里没有的一般性描述和补充内容不算问题。" : "示例内容（由 Agent 补全的地址、价格、评价等）是被允许的，不算问题。";
   const messages: ChatMessage[] = [
-    { role: "system", content: `你是网站内容和设计审查 Agent。只做审查，不修改文件。使用 site-review Skill，对 design.md 和实际源码进行证据审查。允许代码 Agent 自由选择布局和内容表达，不要要求照抄模板。示例内容（由 Agent 补全的地址、价格、评价等）是被允许的，不算问题。只有当页面没有完成用户任务、内容明显过薄、关键区块缺失、存在占位文案、页面高度雷同或核心交互缺失时，才列入 blockingIssues，且每条都要写明文件路径。只输出 JSON：{"ok":true,"score":0,"blockingIssues":[],"suggestions":[],"evidence":[]}。${skillContext}` },
-    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n当前项目文件：\n${sourceBundle}` },
+    { role: "system", content: `你是网站内容和设计审查 Agent。只做审查，不修改文件。使用 site-review Skill，对 design.md 和实际源码进行证据审查。允许代码 Agent 自由选择布局和内容表达，不要要求照抄模板。${factRule}只有当页面没有完成用户任务、内容明显过薄、关键区块缺失、存在占位文案、页面高度雷同或核心交互缺失时，才列入 blockingIssues，且每条都要写明文件路径。只输出 JSON：{"ok":true,"score":0,"blockingIssues":[],"suggestions":[],"evidence":[]}。${skillContext}` },
+    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}${briefSection(brief, 16000)}\n\n当前项目文件：\n${sourceBundle}` },
   ];
   try {
     const { message: assistant } = await deepSeekRequest(apiKey, messages, { responseFormat: { type: "json_object" }, purpose: "review" });
@@ -677,11 +685,14 @@ export function planFromIntent(result: IntentResult, snapshot: ProjectSnapshot):
 export async function createPlan(apiKey: string, projectId: string, message: string, root?: string, onStage?: (label: string) => Promise<void> | void, options: { forceNewSite?: boolean; history?: string } = {}) {
   const [previousPrd, previousDesign, manifest] = root ? await Promise.all([readOptionalFile(root, "docs/prd.md"), readOptionalFile(root, "docs/design.md"), readOptionalFile(root, "src/app/site-manifest.ts")]) : ["", "", ""];
   const projectSummary = root ? JSON.stringify(await listWorkspaceSummaries(root)) : "尚未初始化项目";
+  const brief = briefSection(await readBrief(root));
+  const rules = await contentRules(root);
+  const historyText = options.history ? `\n\n最近对话：\n${options.history}` : "";
   enterStage("plan");
   await onStage?.("正在规划网站结构和页面");
   const sitemap = await requestJson(apiKey, [
-    { role: "system", content: `${sitemapPrompt}${await loadSiteSkills(root, ["requirements"])}` },
-    { role: "user", content: `项目 ID：${projectId}\n当前项目文件摘要：\n${projectSummary}\n\n当前路由清单：\n${manifest || "无"}\n\n已有 PRD（节选）：\n${previousPrd.slice(0, 6000) || "无"}${options.history ? `\n\n最近对话：\n${options.history}` : ""}\n\n用户需求：\n${message}` },
+    { role: "system", content: `${sitemapPrompt}${brief ? `\n\n${materialsPolicy}\n页面规划要跟着资料走：资料里内容多的（产品、工艺、设备、资质）值得单独成页，资料里没有的内容（招聘、新闻、案例）不要为了凑页面而编。` : ""}${await loadSiteSkills(root, ["requirements"])}` },
+    { role: "user", content: `项目 ID：${projectId}\n当前项目文件摘要：\n${projectSummary}\n\n当前路由清单：\n${manifest || "无"}\n\n已有 PRD（节选）：\n${previousPrd.slice(0, 6000) || "无"}${historyText}\n\n用户需求：\n${message}${brief}` },
   ], "plan");
   const plan = normalizePlan(sitemap);
   // 意图识别已经确定是新建网站时，不让规划模型再改判成局部修改。
@@ -695,14 +706,14 @@ export async function createPlan(apiKey: string, projectId: string, message: str
   enterStage("prd");
   await onStage?.("正在使用需求 Skill 编写 PRD");
   const prdMarkdown = await requestMarkdown(apiKey, [
-    { role: "system", content: `${prdPrompt}\n\n${contentPolicy}${await loadSiteSkills(root, ["requirements"])}` },
-    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n页面规划：\n${planJson}` },
+    { role: "system", content: `${prdPrompt}\n\n${rules}${await loadSiteSkills(root, ["requirements"])}` },
+    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}${historyText}\n\n页面规划：\n${planJson}${brief}` },
   ], "prd").catch(() => "");
   enterStage("design");
   await onStage?.("PRD 已完成，正在使用设计 Skill 推导 design.md");
   const designMarkdown = await requestMarkdown(apiKey, [
-    { role: "system", content: `${designPrompt}\n\n${contentPolicy}${await loadSiteSkills(root, ["design-derivation"])}` },
-    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}\n\n页面规划：\n${planJson}\n\nPRD：\n${prdMarkdown || fallbackPrd(message, plan)}` },
+    { role: "system", content: `${designPrompt}\n\n${rules}${await loadSiteSkills(root, ["design-derivation"])}` },
+    { role: "user", content: `项目 ID：${projectId}\n用户需求：\n${message}${historyText}\n\n页面规划：\n${planJson}\n\nPRD：\n${prdMarkdown || fallbackPrd(message, plan)}${brief}` },
   ], "design").catch(() => "");
   return { ...plan, prdMarkdown, designMarkdown };
 }
@@ -891,7 +902,7 @@ export async function applySiteImages(projectId: string, root: string, emit: Wor
   const run = currentRun();
   for (const item of result.stats ?? []) run?.images.push({ stage, ...item });
   const entries = Object.entries(result.manifest).sort(([a], [b]) => a.localeCompare(b));
-  const content = `// 由系统的图片解析步骤自动生成，不要手动编辑。键是 <SiteImage slot="..."> 的 slot。\nexport type SiteImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai"; credit?: string; creditUrl?: string };\n\nexport const images: Record<string, SiteImageAsset> = ${JSON.stringify(Object.fromEntries(entries), null, 2)};\n`;
+  const content = `// 由系统的图片解析步骤自动生成，不要手动编辑。键是 <SiteImage slot="..."> 的 slot。\nexport type SiteImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai" | "material"; credit?: string; creditUrl?: string };\n\nexport const images: Record<string, SiteImageAsset> = ${JSON.stringify(Object.fromEntries(entries), null, 2)};\n`;
   const current = files.find((file) => file.path === "src/content/images.ts")?.content ?? "";
   const changed = current !== content;
   if (changed) await writeFile(safeWorkspacePath(root, "src/content/images.ts"), content, "utf8");
@@ -902,7 +913,7 @@ export async function applySiteImages(projectId: string, root: string, emit: Wor
   await emit({
     type: "images_done",
     ok: failed.length === 0,
-    label: `配图完成：${result.slots ?? 0} 个图片位 · 图库 ${stats.filter((item) => item.source === "pexels" && !item.cached).length} 张 · AI ${stats.filter((item) => item.source === "ai" && !item.cached).length} 张 · 沿用 ${stats.filter((item) => item.cached).length} 张${skipped.length ? ` · 留空 ${skipped.length} 张（${skipped[0].error}）` : ""}${failed.length ? ` · ${failed.length} 个未解析` : ""}`,
+    label: `配图完成：${result.slots ?? 0} 个图片位 · 客户资料 ${stats.filter((item) => item.source === "material").length} 张 · 图库 ${stats.filter((item) => item.source === "pexels" && !item.cached).length} 张 · AI ${stats.filter((item) => item.source === "ai" && !item.cached).length} 张 · 沿用 ${stats.filter((item) => item.cached).length} 张${skipped.length ? ` · 留空 ${skipped.length} 张（${skipped[0].error}）` : ""}${failed.length ? ` · ${failed.length} 个未解析` : ""}`,
     error: [...failed.map((item) => `${item.slot}：${item.error}`), ...stats.filter((item) => item.fallback && !item.cached).slice(0, 1).map((item) => `改用备选来源：${item.fallback}`), ...(result.duplicates?.length ? [`重复的图片位 ID：${result.duplicates.join("、")}`] : [])].slice(0, 3).join("；"),
   });
   return { changed };
@@ -977,8 +988,8 @@ async function runFoundation(context: ExecutionContext, planned: PlannedPage[]) 
     tools: focusedTools,
     maxTurns: 10,
     mustWrite: "src/styles/globals.css、src/content/site.ts、Header 和 Footer",
-    system: `${foundationPrompt}\n\n${contentPolicy}`,
-    user: `项目 ID：${projectId}\n用户需求：\n${message}\n\n网站计划：\n${JSON.stringify({ summary: plan.summary, brand: plan.brand, pages: planned.map((page) => ({ name: page.name, route: page.route, file: page.file, goal: page.goal })) }, null, 2)}\n\n已注册路由：${routeListOf(planned)}\n\n# docs/design.md\n${truncate(design, 24000)}\n\n# 当前文件\n${files}`,
+    system: `${foundationPrompt}\n\n${await contentRules(root)}`,
+    user: `项目 ID：${projectId}\n用户需求：\n${message}${briefSection(await readBrief(root))}\n\n网站计划：\n${JSON.stringify({ summary: plan.summary, brand: plan.brand, pages: planned.map((page) => ({ name: page.name, route: page.route, file: page.file, goal: page.goal })) }, null, 2)}\n\n已注册路由：${routeListOf(planned)}\n\n# docs/design.md\n${truncate(design, 24000)}\n\n# 当前文件\n${files}`,
   });
 }
 
@@ -989,7 +1000,7 @@ function pageAccess(page: PlannedPage): { owned: (file: string) => boolean; scop
   const scope: WriteScope = { description: `${page.file}、src/content/${page.slug}*.ts、src/styles/pages/${page.slug}.css、src/components/sections/${prefix}*.tsx`, allows: owned };
   const readScope: ReadScope = {
     reason: "其他页面由别的 Agent 负责，不要参考它们；需要的共享文件已经附在消息里。",
-    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/") || file === "skills/blocks/SKILL.md",
+    allows: (file) => owned(file) || file === "src/content/site.ts" || file === "src/app/router.tsx" || file === "src/app/site-manifest.ts" || file.startsWith("src/components/") || file.startsWith("src/styles/") || file.startsWith("docs/") || file.startsWith("materials/") || file === "skills/blocks/SKILL.md",
   };
   return { owned, scope, readScope };
 }
@@ -1017,8 +1028,8 @@ async function runPage(context: ExecutionContext, page: PlannedPage, planned: Pl
     tools: focusedTools,
     maxTurns: 8,
     mustWrite: page.file,
-    system: `${pagePrompt(page, routeListOf(planned))}\n\n${contentPolicy}`,
-    user: `项目 ID：${projectId}\n用户需求：\n${message}\n\n# 本页计划\n${JSON.stringify({ ...pagePlan, route: page.route, file: page.file }, null, 2)}\n\n# design.md（全局部分 + 本页蓝图）\n${designExcerpt(design, page.route)}\n\n# globals.css 中已有的类名（可以直接使用）\n${cssClassSummary(globals)}\n\n# 当前文件\n${files}`,
+    system: `${pagePrompt(page, routeListOf(planned))}\n\n${await contentRules(root)}`,
+    user: `项目 ID：${projectId}\n用户需求：\n${message}${briefSection(await readBrief(root))}\n\n# 本页计划\n${JSON.stringify({ ...pagePlan, route: page.route, file: page.file }, null, 2)}\n\n# design.md（全局部分 + 本页蓝图）\n${designExcerpt(design, page.route)}\n\n# globals.css 中已有的类名（可以直接使用）\n${cssClassSummary(globals)}\n\n# 当前文件\n${files}`,
   });
 }
 
@@ -1082,7 +1093,7 @@ async function executeChange(context: ExecutionContext) {
     tag: "修改",
     tools: authoringTools,
     maxTurns: 16,
-    system: `${executionPrompt}\n\n${contentPolicy}\n\n本次修改计划：\n${JSON.stringify({ summary: plan.summary, pages: plan.pages }, null, 2)}`,
+    system: `${executionPrompt}\n\n${await contentRules(root)}\n\n本次修改计划：\n${JSON.stringify({ summary: plan.summary, pages: plan.pages }, null, 2)}`,
     user: `项目 ID：${projectId}\n用户需求：\n${message}${historyBlock(history)}\n\n${await changeContext(root, pageFiles)}`,
     verify: () => projectVerify(projectId, root),
   });
@@ -1130,7 +1141,7 @@ async function executeRepair(context: ExecutionContext, repairMessage: string) {
     tools: focusedTools,
     maxTurns: 8,
     mustWrite: implicated.slice(0, 3).join("、") || undefined,
-    system: `你是建站项目的修复 Agent。只修复下面列出的问题，不要重写没有问题的内容，不要改动与问题无关的文件。出问题的文件已经完整附在消息里，直接修改；第 3 轮之前必须完成写入。小改动用 apply_patch，大面积修改用 write_file。\n\n${contentPolicy}`,
+    system: `你是建站项目的修复 Agent。只修复下面列出的问题，不要重写没有问题的内容，不要改动与问题无关的文件。出问题的文件已经完整附在消息里，直接修改；第 3 轮之前必须完成写入。小改动用 apply_patch，大面积修改用 write_file。\n\n${await contentRules(root)}`,
     user: `项目 ID：${projectId}\n原始需求：\n${message}${historyBlock(history)}\n\n# 需要修复的问题\n${remaining.map((issue) => `- ${issue}`).join("\n")}\n\n# 相关文件\n${await fileBundle(root, [...implicated, "src/app/site-manifest.ts", "src/app/App.tsx"], 40000)}`,
     verify: () => projectVerify(projectId, root),
   });

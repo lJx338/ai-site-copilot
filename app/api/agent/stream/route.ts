@@ -1,8 +1,10 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { checkWorkspace, ensureWorkspace, listWorkspaceFiles, pageMetrics, projectRoot, refreshSystemFiles, removeFilesNotIn, safeWorkspacePath } from "../../../../lib/project-workspace";
 import { applyAutoFixes, applySiteImages, classifyIntent, executeVisualFixes, fixableVisualIssues, createPlan, executePlan, materializePlanDocs, planFromIntent, projectSnapshot, reviewSite, visualReview, type Intent, type SitePlan, type SiteReview, type VisualReview, type WorkflowEmitter } from "../../../../lib/agent-workflow";
 import { inspectPreview, restoreWorkspaceFromPreview, saveRunReport, syncWorkspaceToPreview, validatePreview, type InspectResult, type ValidationResult } from "../../../../lib/preview-client";
 import { enterStage, formatSummaryTable, RunTelemetry, withRun } from "../../../../lib/telemetry";
+import { readMaterials } from "../../../../lib/materials";
 
 export const runtime = "nodejs";
 
@@ -39,8 +41,17 @@ function logEvent(projectId: string, event: Record<string, unknown>) {
   console.log(`[agent:${projectId}] ${new Date().toLocaleTimeString("zh-CN", { hour12: false })} ${String(event.type)} ${label}${error}`);
 }
 
+// 资料卡状态：ready = 已提炼、等用户确认；built = 已经按资料建过站。放在 materials/ 里随工作区同步。
+const MATERIALS_STATUS = "materials/status.json";
+async function materialsState(root: string) {
+  try { return (JSON.parse(await readFile(path.join(root, MATERIALS_STATUS), "utf8")) as { state?: string }).state ?? ""; } catch { return ""; }
+}
+async function setMaterialsState(root: string, state: "ready" | "built") {
+  await writeFile(path.join(root, MATERIALS_STATUS), JSON.stringify({ state, at: new Date().toISOString() }), "utf8");
+}
+
 export async function POST(request: Request) {
-  let body: { message?: string; projectId?: string; apiKey?: string; history?: unknown };
+  let body: { message?: string; projectId?: string; apiKey?: string; history?: unknown; materials?: boolean };
   try { body = await request.json() as typeof body; } catch { return Response.json({ error: "请求格式不正确" }, { status: 400 }); }
   const message = body.message?.trim();
   const projectId = body.projectId?.trim() || "coffee-studio";
@@ -97,10 +108,24 @@ export async function POST(request: Request) {
       };
       withRun(run, async () => {
         try {
+          // ---- 刚上传了资料：先读资料、给出资料卡，等用户确认后再建站 ----
+          if (body.materials) {
+            run.intent = "materials";
+            const { reply } = await readMaterials({ apiKey, projectId, root, emit });
+            await setMaterialsState(root, "ready");
+            await syncWorkspaceToPreview(projectId, root);
+            const usage = await finalizeRun("materials_ready");
+            await emit({ type: "completed", result: { reply: `${reply}\n\n${usage.line}`, files: await listWorkspaceFiles(root), events: [], readOnly: true, validation: { ok: true, skipped: true }, usage: usage.summary.totals } });
+            return;
+          }
           enterStage("intent");
           await emit({ type: "stage", stage: "intent", label: "正在理解你的需求" });
           const snapshot = await projectSnapshot(root);
-          const intent = await classifyIntent(apiKey, message, history, snapshot);
+          // 资料卡等待确认时，用户的回复（“开始建站”“成立时间按 2008 年”）就是按资料新建网站
+          const briefPending = (await materialsState(root)) === "ready";
+          const intent = briefPending && !/[?？]$/.test(message)
+            ? { intent: "new_site" as Intent, summary: "按客户资料新建网站", routes: [], reason: "资料卡已给出，用户确认后按资料建站", provider: "heuristic" as const }
+            : await classifyIntent(apiKey, message, history, snapshot);
           run.intent = intent.intent;
           run.intentReason = intent.reason;
           await emit({ type: "intent", intent: intent.intent, label: `${intentLabels[intent.intent]}${intent.reason ? `（${intent.reason}）` : ""}` });
@@ -125,6 +150,7 @@ export async function POST(request: Request) {
             enterStage("execution");
             await emit({ type: "stage", stage: "execution", label: "PRD 和设计规范已生成，开始按文档建站" });
             execution = await executePlan({ apiKey, projectId, message, plan, root, emit, history });
+            if (briefPending) await setMaterialsState(root, "built");
           } else {
             plan = planFromIntent(intent, snapshot);
             if (intent.intent === "modify") {

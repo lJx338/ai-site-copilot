@@ -25,7 +25,7 @@ import { Hero, FeatureGrid, SplitFeature, ProductGrid, StatsBand, Testimonials, 
 | 区块 | 用途 | 变体 |
 |---|---|---|
 | `Hero` | 页面首屏：标题、说明、按钮、主图、关键数字 | `split` 左文右图（默认）、`overlay` 满屏大图加蒙版（适合首页和氛围强的行业）、`centered` 居中文字加下方宽图 |
-| `LogoCloud` | 客户或合作伙伴名称条，放在首屏后做信任背书 | — |
+| `LogoCloud` | 客户或合作伙伴 logo 条，放在首屏后做信任背书。`items` 写名称字符串（文字 logo），资料里有 logo 图片时写 `{ name, asset: "m3" }` | — |
 | `StatsBand` | 一排关键数字（3–4 个），默认深色，打断页面节奏 | — |
 | `FeatureGrid` | 卖点、服务、优势 | `cards` 带图卡片、`icons` 图标加文字（图标用 lucide-react）、`bento` 首项大格突出核心卖点 |
 | `SplitFeature` | 图文左右交错讲 2–4 个重点（方案、工艺、流程、空间） | `startImageLeft` 控制起始方向 |

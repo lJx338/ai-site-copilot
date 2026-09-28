@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { ArrowUp, Check, CircleAlert, History, LoaderCircle, Monitor, PanelRight, RefreshCw, Smartphone, Sparkles, WandSparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowUp, Check, CircleAlert, FileText, History, LoaderCircle, Monitor, PanelRight, Paperclip, RefreshCw, Smartphone, Sparkles, WandSparkles, X } from "lucide-react";
 
 type Message = { role: "assistant" | "user"; text: string; changes?: string[] };
 type AgentFile = { path: string; content: string };
@@ -40,6 +40,10 @@ export default function Home() {
   const [mobilePreview, setMobilePreview] = useState(false);
   const [plan, setPlan] = useState<SitePlan | null>(null);
   const [runEvents, setRunEvents] = useState<WorkflowEvent[]>([]);
+  // 已上传、还没让 Agent 读过的资料；下一条消息会先读资料、给出资料卡
+  const [pendingMaterials, setPendingMaterials] = useState<string[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     window.localStorage.removeItem("deepseek-copilot-messages");
@@ -65,21 +69,48 @@ export default function Home() {
     setPreviewUrl(`/api/preview?projectId=${projectId}&v=${Date.now()}`);
   }
 
+  async function uploadMaterials(list: FileList | null) {
+    if (!list?.length) return;
+    setUploading(true);
+    try {
+      const rejected: string[] = [];
+      for (const file of Array.from(list)) {
+        const response = await fetch(`/api/materials?projectId=${projectId}&name=${encodeURIComponent(file.name)}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file });
+        const payload = await response.json().catch(() => ({})) as { name?: string; error?: string };
+        if (response.ok && payload.name) setPendingMaterials((current) => [...new Set([...current, payload.name!])]);
+        else rejected.push(`${file.name}（${payload.error || `HTTP ${response.status}`}）`);
+      }
+      if (rejected.length) setMessages((current) => [...current, { role: "assistant", text: `这些文件没有上传：${rejected.join("、")}` }]);
+    } catch (error) {
+      setMessages((current) => [...current, { role: "assistant", text: error instanceof Error ? error.message : "资料上传失败" }]);
+    } finally {
+      setUploading(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  async function clearUploaded() {
+    await fetch(`/api/materials?projectId=${projectId}`, { method: "DELETE" }).catch(() => undefined);
+    setPendingMaterials([]);
+  }
+
   async function submit(raw = input) {
-    const message = raw.trim();
-    if (!message || busy) return;
+    const withMaterials = pendingMaterials.length > 0;
+    const message = raw.trim() || (withMaterials ? "请先阅读我上传的资料" : "");
+    if (!message || busy || uploading) return;
     setInput("");
     setBusy(true);
     setStatus("正在分析需求");
     setPlan(null);
     setRunEvents([]);
-    setMessages((current) => [...current, { role: "user", text: message }]);
+    setMessages((current) => [...current, { role: "user", text: withMaterials ? `${message}\n\n📎 ${pendingMaterials.join("、")}` : message }]);
+    setPendingMaterials([]);
     try {
       const response = await fetch("/api/agent/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // 带上最近几轮对话（不含开场白），让后端能理解“刚才那个”“再改一点”。
-        body: JSON.stringify({ message, projectId, apiKey, history: messages.slice(1).slice(-8).map(({ role, text }) => ({ role, text })) }),
+        body: JSON.stringify({ message, projectId, apiKey, materials: withMaterials, history: messages.slice(1).slice(-8).map(({ role, text }) => ({ role, text })) }),
       });
       if (!response.ok) {
         const errorText = await response.text();
@@ -166,10 +197,18 @@ export default function Home() {
           <div className="border-t border-[#efeee9] p-4">
             <div className="mb-3 flex gap-2 overflow-x-auto pb-1 scrollbar-none">{starterPrompts.map((prompt) => <button key={prompt} onClick={() => submit(prompt)} disabled={busy} className="shrink-0 rounded-full border border-[#e7e3dc] bg-[#fcfbf8] px-3 py-1.5 text-[11px] text-[#777067] transition hover:border-[#c9a17c] hover:text-[#8b5d3e] disabled:opacity-50">{prompt}</button>)}</div>
             <form onSubmit={(event) => { event.preventDefault(); submit(); }} className="relative rounded-2xl border border-[#dedbd4] bg-[#fcfbf8] p-3 shadow-[0_6px_20px_rgba(55,45,35,.05)] focus-within:border-[#b58c69]">
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder="描述你想创建或修改的网站..." rows={3} className="w-full resize-none bg-transparent pr-10 text-sm leading-6 text-[#423c35] outline-none placeholder:text-[#b5afa6]" />
-              <button type="submit" disabled={!input.trim() || busy} className="absolute bottom-3 right-3 grid h-8 w-8 place-items-center rounded-xl bg-[#2d2925] text-white transition hover:bg-[#b4774b] disabled:cursor-not-allowed disabled:opacity-30"><ArrowUp className="h-4 w-4" /></button>
+              {(pendingMaterials.length > 0 || uploading) && (
+                <div className="mb-2 flex flex-wrap items-center gap-1.5">
+                  {pendingMaterials.map((name) => <span key={name} className="inline-flex max-w-full items-center gap-1 rounded-md border border-[#eadfd4] bg-white px-2 py-1 text-[11px] text-[#6d6259]"><FileText className="h-3 w-3 shrink-0 text-[#b4774b]" /><span className="truncate">{name}</span></span>)}
+                  {uploading ? <span className="inline-flex items-center gap-1 text-[11px] text-[#a29d94]"><LoaderCircle className="h-3 w-3 animate-spin" />上传中</span> : <button type="button" onClick={clearUploaded} className="inline-flex items-center gap-0.5 text-[11px] text-[#a29d94] hover:text-[#b05e49]"><X className="h-3 w-3" />清空资料</button>}
+                </div>
+              )}
+              <textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={pendingMaterials.length ? "说说想要什么样的网站，或直接发送让 Agent 先读资料…" : "描述你想创建或修改的网站..."} rows={3} className="w-full resize-none bg-transparent pl-8 pr-10 text-sm leading-6 text-[#423c35] outline-none placeholder:text-[#b5afa6]" />
+              <input ref={fileInput} type="file" multiple accept=".pdf,.xlsx,.docx,.csv,.md,.txt,image/*" className="hidden" onChange={(event) => uploadMaterials(event.target.files)} />
+              <button type="button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} title="上传资料（公司介绍、产品表、logo、照片）" aria-label="上传资料" className="absolute bottom-3 left-3 grid h-8 w-8 place-items-center rounded-xl text-[#8c857b] transition hover:bg-[#f0ebe4] hover:text-[#8b5d3e] disabled:opacity-30"><Paperclip className="h-4 w-4" /></button>
+              <button type="submit" disabled={(!input.trim() && !pendingMaterials.length) || busy || uploading} className="absolute bottom-3 right-3 grid h-8 w-8 place-items-center rounded-xl bg-[#2d2925] text-white transition hover:bg-[#b4774b] disabled:cursor-not-allowed disabled:opacity-30"><ArrowUp className="h-4 w-4" /></button>
             </form>
-            <p className="mt-2 text-center text-[10px] text-[#b2ada5]">Agent 会先分析，再修改必要文件并检查预览</p>
+            <p className="mt-2 text-center text-[10px] text-[#b2ada5]">可以上传公司介绍、产品表、logo 和照片，Agent 会先整理成资料卡再建站</p>
           </div>
         </aside>
 

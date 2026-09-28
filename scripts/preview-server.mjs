@@ -10,6 +10,7 @@ import path from "node:path";
 import { build } from "vite";
 import react from "@vitejs/plugin-react";
 import sharp from "sharp";
+import { ingestMaterials, materialsDir, saveOriginal } from "./materials.mjs";
 
 // 预览服务是单独的进程，拿不到 vinext 读取的 .env.local，这里自己读一次（图库和 AI 生图的 key）。
 try { process.loadEnvFile(path.join(process.cwd(), ".env.local")); } catch { /* no .env.local */ }
@@ -25,6 +26,8 @@ const previewWorkspaceBase = path.join(workspaceBase, ".preview-workspaces");
 const runsBase = path.join(workspaceBase, ".runs");
 // 图片是二进制文件，不走文本快照同步；按项目单独存放，由本服务提供访问地址。
 const assetsBase = path.join(workspaceBase, ".assets");
+// 用户上传的资料：原件、解析出的文字和图片。不放进项目工作区（二进制文件不参与文本同步）。
+const materialsBase = path.join(workspaceBase, ".materials");
 const previewCache = new Map();
 const workspaceSignatures = new Map();
 const projectQueues = new Map();
@@ -569,15 +572,15 @@ async function archiveRun(runDir, projectId) {
 // ---- 图片解析：Agent 用 <SiteImage> 声明需要什么图，这里负责找图或生成 ----
 const RATIO_SIZES = {
   "21:9": [1920, 823], "16:9": [1600, 900], "3:2": [1500, 1000], "4:3": [1400, 1050],
-  "1:1": [1200, 1200], "3:4": [1050, 1400], "2:3": [1000, 1500], fill: [1600, 1000],
+  "1:1": [1200, 1200], "3:4": [1050, 1400], "2:3": [1000, 1500], "3:1": [900, 300], fill: [1600, 1000],
 };
 // Seedream 要求较高的像素总量，按比例给出约 2K 的尺寸
 const AI_SIZES = {
   "21:9": "3024x1296", "16:9": "2560x1440", "3:2": "2496x1664", "4:3": "2304x1728",
-  "1:1": "2048x2048", "3:4": "1728x2304", "2:3": "1664x2496", fill: "2560x1440",
+  "1:1": "2048x2048", "3:4": "1728x2304", "2:3": "1664x2496", "3:1": "3024x1296", fill: "2560x1440",
 };
 const COLLECT_IMAGES = `JSON.stringify([...document.querySelectorAll("[data-image-slot]")].map((el) => ({
-  slot: el.dataset.imageSlot, kind: el.dataset.imageKind || "photo", query: el.dataset.imageQuery || "",
+  slot: el.dataset.imageSlot, kind: el.dataset.imageKind || "photo", asset: el.dataset.imageAsset || "", query: el.dataset.imageQuery || "",
   prompt: el.dataset.imagePrompt || "", ratio: el.dataset.imageRatio || "16:9", alt: el.dataset.imageAlt || "",
 })))`;
 
@@ -683,6 +686,29 @@ async function resolveImages(projectId, style) {
     const itemStarted = Date.now();
     // 产品图按图片位 ID 缓存（同一产品在不同页面的描述可能略有不同，但应该是同一张图）；
     // 其他图片按描述缓存，描述变了才重新找图。
+    // 用户资料里的图片：按资料图片 ID 取，裁成需要的比例，不放大（小图宁可小，不糊）；logo 完整保留不裁切
+    if (slot.asset) {
+      const source = path.join(materialsDir(materialsBase, projectId), "images", `${slot.asset.replace(/[^a-zA-Z0-9_-]/g, "")}.jpg`);
+      if (existsSync(source)) {
+        const file = `material-${slot.asset}-${slot.kind === "logo" ? "logo" : slot.ratio.replace(":", "x")}.webp`;
+        const buffer = await readFile(source);
+        const meta = await sharp(buffer).metadata();
+        const [tw, th] = RATIO_SIZES[slot.ratio] || RATIO_SIZES["16:9"];
+        let output, width, height;
+        if (slot.kind === "logo") {
+          output = await sharp(buffer).resize(600, 240, { fit: "inside", withoutEnlargement: true }).webp({ quality: 90 }).toBuffer();
+          ({ width, height } = await sharp(output).metadata());
+        } else {
+          const scale = Math.min(1, meta.width / tw, meta.height / th);
+          width = Math.max(1, Math.round(tw * scale)); height = Math.max(1, Math.round(th * scale));
+          output = await sharp(buffer).resize(width, height, { fit: "cover", position: "attention" }).webp({ quality: 82 }).toBuffer();
+        }
+        await writeFile(path.join(dir, file), output);
+        manifest[slot.slot] = { width, height, source: "material", src: `http://127.0.0.1:${port}/assets/${path.basename(dir)}/${file}` };
+        stats.push({ slot: slot.slot, route: slot.route, source: "material", cached: false, ms: Date.now() - itemStarted, bytes: output.length });
+        return;
+      }
+    }
     const descriptor = slot.kind === "product" ? `product|${slot.slot}|${slot.ratio}` : `${slot.kind}|${slot.query}|${slot.prompt}|${slot.ratio}|${!slot.query ? style : ""}`;
     const hash = createHash("sha1").update(descriptor).digest("hex").slice(0, 16);
     const cached = index[hash];
@@ -869,6 +895,40 @@ const server = createServer(async (request, response) => {
     } catch (error) {
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       response.end(JSON.stringify({ skipped: true, reason: error instanceof Error ? error.message : "图片解析失败" }));
+    }
+    return;
+  }
+  // ---- 上传资料：/materials/upload 存原件，/materials/ingest 解析，/materials/clear 清空 ----
+  if (url.pathname.startsWith("/materials/") && request.method === "POST") {
+    const projectId = url.searchParams.get("projectId") || "coffee-studio";
+    const dir = materialsDir(materialsBase, projectId);
+    try {
+      let result;
+      if (url.pathname === "/materials/upload") {
+        const chunks = [];
+        for await (const chunk of request) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        if (!buffer.length) throw new Error("文件是空的");
+        if (buffer.length > 60 * 1024 * 1024) throw new Error("单个文件不能超过 60MB");
+        result = { ok: true, name: await saveOriginal(dir, url.searchParams.get("name") || "file", buffer), bytes: buffer.length };
+      } else if (url.pathname === "/materials/clear") {
+        await rm(dir, { recursive: true, force: true });
+        result = { ok: true };
+      } else if (url.pathname === "/materials/ingest") {
+        const index = await ingestMaterials(dir);
+        // 附上缩小后的图片给看图模型：素材图长边 768，整页图 1400
+        const encode = async (file, size) => (await sharp(await readFile(path.join(dir, file))).resize(size, size, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 78 }).toBuffer()).toString("base64");
+        result = {
+          ...index,
+          images: await Promise.all(index.images.map(async (image) => ({ ...image, b64: image.grade === "blank" ? "" : await encode(image.file, 768) }))),
+          pages: await Promise.all(index.pages.map(async (page) => ({ ...page, b64: await encode(page.file, 1400) }))),
+        };
+      } else { response.writeHead(404); response.end(); return; }
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      response.end(JSON.stringify(result));
+    } catch (error) {
+      response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "资料处理失败" }));
     }
     return;
   }

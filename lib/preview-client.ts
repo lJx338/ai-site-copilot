@@ -100,8 +100,8 @@ export async function fetchScreens(projectId: string, maxTiles = 6): Promise<{ s
   }
 }
 
-export type ImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai"; credit?: string; creditUrl?: string };
-export type ImageStat = { slot: string; route?: string; source: "pexels" | "ai" | "none"; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string; skipped?: boolean };
+export type ImageAsset = { src: string; width: number; height: number; source: "pexels" | "ai" | "material"; credit?: string; creditUrl?: string };
+export type ImageStat = { slot: string; route?: string; source: "pexels" | "ai" | "material" | "none"; cached: boolean; ms: number; bytes?: number; error?: string; fallback?: string; skipped?: boolean };
 export type ImageResolveResult = { skipped?: boolean; reason?: string; slots?: number; duplicates?: string[]; manifest?: Record<string, ImageAsset>; stats?: ImageStat[]; ms?: number };
 
 // 让预览服务收集页面上的 <SiteImage> 图片位，从图库搜索或用 AI 生成。调用前需要先同步工作区。
@@ -113,4 +113,27 @@ export async function resolveImages(projectId: string, style: string): Promise<I
   } catch (error) {
     return { skipped: true, reason: error instanceof Error ? error.message : "图片解析不可用" };
   }
+}
+
+// ---- 用户上传的资料：原件存在预览服务，解析结果（文字、缩小后的图片）返回给 Agent 做提炼 ----
+export type MaterialImage = { id: string; file: string; from: string; width: number; height: number; grade: "blank" | "tiny" | "small" | "medium" | "large"; b64: string };
+export type MaterialPage = { id: string; file: string; from: string; textChars: number; b64: string };
+export type MaterialIndex = { files: Array<{ name: string; type: string; textChars?: number; images?: number; pages?: number; text?: string; error?: string }>; images: MaterialImage[]; pages: MaterialPage[] };
+
+export async function uploadMaterial(projectId: string, name: string, data: ArrayBuffer) {
+  const response = await fetch(`${previewServerUrl()}/materials/upload?projectId=${encodeURIComponent(projectId)}&name=${encodeURIComponent(name)}`, { method: "POST", body: data });
+  const payload = await response.json() as { ok: boolean; name?: string; bytes?: number; error?: string };
+  if (!payload.ok) throw new Error(payload.error || `上传失败 HTTP ${response.status}`);
+  return payload;
+}
+
+export async function clearMaterials(projectId: string) {
+  await fetch(`${previewServerUrl()}/materials/clear?projectId=${encodeURIComponent(projectId)}`, { method: "POST" });
+}
+
+export async function ingestMaterialFiles(projectId: string): Promise<MaterialIndex> {
+  const response = await fetch(`${previewServerUrl()}/materials/ingest?projectId=${encodeURIComponent(projectId)}`, { method: "POST" });
+  const payload = await response.json() as MaterialIndex & { ok?: boolean; error?: string };
+  if (payload.ok === false) throw new Error(payload.error || "资料解析失败");
+  return payload;
 }
