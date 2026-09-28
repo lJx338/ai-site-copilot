@@ -333,6 +333,9 @@ const PREPARE_PAGE = `(async () => {
   for (const img of document.images) img.loading = "eager";
   for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.8) { scrollTo(0, y); await wait(120); }
   scrollTo(0, 0);
+  // "进入视口才淡入"的内容：无头浏览器里 0.12 秒一步的滚动来不及触发，实测 23 个只显示了 3 个，
+  // 截图里整段空白，看图审查会误判成"区块没渲染"。截图时一律直接显示。
+  for (const el of document.querySelectorAll(".blk-reveal")) el.classList.add("is-visible");
   await Promise.race([
     Promise.all([...document.images].map((img) => img.complete ? null : new Promise((r) => { img.addEventListener("load", r, { once: true }); img.addEventListener("error", r, { once: true }); }))),
     wait(8000),
@@ -400,6 +403,9 @@ const VISUAL_LINT = `(() => {
       }
     }
     if (text) {
+      // 文字贴到屏幕边缘：页面样式覆盖了区块容器的宽度（例如 .blk__inner { width: 100% }），左右留白没了
+      // 跳过屏幕外的元素（读屏专用文字、收起的抽屉菜单）、横向滚动条里的内容和图片上的署名
+      if (r.width > 2 && r.right > 0 && r.left < vw && (r.left < 8 || r.right > vw - 8) && !scroller(el) && !el.closest(".site-image")) add(must, "edge-text", "文字贴到屏幕边缘，缺少左右留白", where(el) + " 距左 " + Math.round(r.left) + "px / 距右 " + Math.round(vw - r.right) + "px");
       const fs = parseFloat(cs.fontSize);
       if (mobile && fs < 12) { smallText++; add(should, "small-text", "手机上文字小于 12px", where(el) + " " + fs + "px"); }
       const fg = color(cs.color), bg = background(el);
@@ -429,6 +435,8 @@ async function analyzePage(send, url, { width, height, mobile, fullFile, maxTile
   const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
   try {
     await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile }, sessionId);
+    // 按"减少动效"渲染：区块库和遵守该设置的自写动画都会直接显示最终状态，截图不受入场动画影响。
+    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] }, sessionId);
     await send("Page.navigate", { url }, sessionId);
     await new Promise((resolve) => setTimeout(resolve, 300));
     await waitForApp(send, sessionId);
