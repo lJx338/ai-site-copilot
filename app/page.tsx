@@ -44,6 +44,16 @@ export default function Home() {
   const [pendingMaterials, setPendingMaterials] = useState<string[]>([]);
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  // 拖拽上传：进入子元素时也会触发 dragenter/dragleave，用计数判断是否真的拖出了会话区
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  const hasFiles = (event: React.DragEvent) => Array.from(event.dataTransfer.types).includes("Files");
+  const dropHandlers = {
+    onDragEnter: (event: React.DragEvent) => { if (!hasFiles(event)) return; event.preventDefault(); dragDepth.current += 1; setDragging(true); },
+    onDragOver: (event: React.DragEvent) => { if (!hasFiles(event)) return; event.preventDefault(); event.dataTransfer.dropEffect = busy ? "none" : "copy"; },
+    onDragLeave: (event: React.DragEvent) => { if (!hasFiles(event)) return; dragDepth.current = Math.max(0, dragDepth.current - 1); if (!dragDepth.current) setDragging(false); },
+    onDrop: (event: React.DragEvent) => { if (!hasFiles(event)) return; event.preventDefault(); dragDepth.current = 0; setDragging(false); if (!busy) uploadMaterials(event.dataTransfer.files); },
+  };
 
   useEffect(() => {
     window.localStorage.removeItem("deepseek-copilot-messages");
@@ -56,6 +66,14 @@ export default function Home() {
     if (savedFiles) {
       try { setFiles(JSON.parse(savedFiles) as AgentFile[]); } catch { window.localStorage.removeItem("deepseek-copilot-files"); }
     }
+  }, []);
+
+  // 文件拖到会话区以外（比如预览区）时，浏览器默认会直接打开文件、离开当前页面，会话就丢了
+  useEffect(() => {
+    const block = (event: DragEvent) => { if (event.dataTransfer && Array.from(event.dataTransfer.types).includes("Files")) event.preventDefault(); };
+    window.addEventListener("dragover", block);
+    window.addEventListener("drop", block);
+    return () => { window.removeEventListener("dragover", block); window.removeEventListener("drop", block); };
   }, []);
 
   useEffect(() => {
@@ -175,7 +193,12 @@ export default function Home() {
       </header>
 
       <div className="grid h-[calc(100vh-68px)] grid-cols-[380px_minmax(0,1fr)] max-xl:grid-cols-[340px_minmax(0,1fr)] max-md:grid-cols-1">
-        <aside className="order-1 flex min-h-0 flex-col border-r border-[#e7e6e1] bg-white max-md:h-[52vh] max-md:border-r-0 max-md:border-b">
+        <aside {...dropHandlers} className="relative order-1 flex min-h-0 flex-col border-r border-[#e7e6e1] bg-white max-md:h-[52vh] max-md:border-r-0 max-md:border-b">
+          {dragging && (
+            <div className="pointer-events-none absolute inset-3 z-20 grid place-items-center rounded-2xl border-2 border-dashed border-[#c9a17c] bg-[#fffaf5]/95">
+              <div className="text-center text-[#8b5d3e]"><Paperclip className="mx-auto mb-2 h-6 w-6" /><p className="text-sm font-medium">{busy ? "Agent 正在工作，稍后再上传" : "松开即可上传资料"}</p><p className="mt-1 text-[11px] text-[#a98c73]">PDF、Excel、Word、图片，可一次拖多个</p></div>
+            </div>
+          )}
           <div className="flex items-center justify-between border-b border-[#efeee9] px-5 py-4">
             <div><p className="text-sm font-semibold">Copilot 会话</p><p className="mt-0.5 text-[11px] text-[#aaa69e]">分析需求 · 执行修改 · 构建校验 · 自动修复</p></div>
             <div className="flex items-center gap-2 text-[#aaa69e]"><History className="h-4 w-4" /><PanelRight className="h-4 w-4" /></div>
@@ -208,7 +231,7 @@ export default function Home() {
               <button type="button" onClick={() => fileInput.current?.click()} disabled={busy || uploading} title="上传资料（公司介绍、产品表、logo、照片）" aria-label="上传资料" className="absolute bottom-3 left-3 grid h-8 w-8 place-items-center rounded-xl text-[#8c857b] transition hover:bg-[#f0ebe4] hover:text-[#8b5d3e] disabled:opacity-30"><Paperclip className="h-4 w-4" /></button>
               <button type="submit" disabled={(!input.trim() && !pendingMaterials.length) || busy || uploading} className="absolute bottom-3 right-3 grid h-8 w-8 place-items-center rounded-xl bg-[#2d2925] text-white transition hover:bg-[#b4774b] disabled:cursor-not-allowed disabled:opacity-30"><ArrowUp className="h-4 w-4" /></button>
             </form>
-            <p className="mt-2 text-center text-[10px] text-[#b2ada5]">可以上传公司介绍、产品表、logo 和照片，Agent 会先整理成资料卡再建站</p>
+            <p className="mt-2 text-center text-[10px] text-[#b2ada5]">可以把公司介绍、产品表、logo 和照片拖到这里，Agent 会先整理成资料卡再建站</p>
           </div>
         </aside>
 
